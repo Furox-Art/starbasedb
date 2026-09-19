@@ -1,0 +1,305 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import {
+    ChunkedDumpEngine,
+    DEFAULT_DUMP_OPTIONS,
+    isSafeIdentifier,
+    makeDumpFileName,
+    serializeRows,
+    DUMP_STATE_KEY,
+    DUMP_CHUNK_KEY,
+    type ChunkRecord,
+    type DumpOptions,
+    type DumpState,
+} from './chunkedDump'
+import { executeOperation } from './index'
+import type { DataSource } from '../types'
+import type { StarbaseDBConfiguration } from '../handler'
+
+vi.mock('./index', () => ({
+    executeOperation: vi.fn(),
+}))
+
+type StorageMap = Map<string, unknown>
+
+const makeStorage = () => {
+    const map: StorageMap = new Map()
+    return {
+        get: vi.fn(async <T>(key: string) => map.get(key) as T),
+        put: vi.fn(async (key: string, value: unknown) => {
+            map.set(key, value)
+        }),
+        delete: vi.fn(async (key: string) => {
+            map.delete(key)
+        }),
+        _map: map,
+    }
+}
+
+const makeR2 = () => ({
+    put: vi.fn(async () => undefined),
+    get: vi.fn(async () => null),
+})
+
+const makeDataSource = (): DataSource =>
+    ({ source: 'internal', rpc: {} }) as unknown as DataSource
+
+const makeConfig = (): StarbaseDBConfiguration => ({ role: 'admin' })
+
+const makeEngine = (overrides: Partial<DumpOptions> = {}) => {
+    const storage = makeStorage()
+    const r2 = makeR2()
+    const engine = new ChunkedDumpEngine(
+        storage as unknown as DurableObjectStorage,
+        r2 as unknown as R2Bucket,
+        makeDataSource(),
+        makeConfig(),
+        { ...DEFAULT_DUMP_OPTIONS, ...overrides }
+    )
+    return { engine, storage, r2 }
+}
+
+beforeEach(() => {
+    vi.clearAllMocks()
+})
+
+describe('identifier safety', () => {
+    it('accepts ordinary table names', () => {
+        expect(isSafeIdentifier('users')).toBe(true)
+        expect(isSafeIdentifier('order_items2')).toBe(true)
+    })
+
+    it('rejects injection attempts', () => {
+        expect(isSafeIdentifier('users; DROP TABLE users')).toBe(false)
+        expect(isSafeIdentifier('users"')).toBe(false)
+        expect(isSafeIdentifier('tmp_cache')).toBe(true) // syntactically safe
+    })
+})
+
+describe('row serialization', () => {
+    it('escapes single quotes in strings', () => {
+        const { content } = serializeRows('users', [{ name: "O'Brien" }])
+        expect(content).toContain("'O''Brien'")
+        expect(content).toContain('INSERT INTO "users"')
+    })
+
+    it('renders NULLs, numbers and booleans unquoted', () => {
+        const { content } = serializeRows('t', [
+            { a: null, b: 1.5, c: true },
+        ])
+        expect(content).toContain('(NULL, 1.5, true)')
+    })
+
+    it('returns empty content for zero rows', () => {
+        const { content, rowCount } = serializeRows('t', [])
+        expect(content).toBe('')
+        expect(rowCount).toBe(0)
+    })
+})
+
+describe('dump file naming', () => {
+    it('follows dump_YYYYMMDD-HHMMSS.sql in UTC', () => {
+        const name = makeDumpFileName(new Date('2024-01-01T17:00:00Z'))
+        expect(name).toBe('dump_20240101-170000.sql')
+    })
+})
+
+describe('ChunkedDumpEngine cycles', () => {
+    const setupTables = (tables: string[], schemas: Record<string, string>) => {
+        vi.mocked(executeOperation).mockImplementation(async (queries: any) => {
+            const sql: string = queries[0].sql
+            if (sql.includes("type='table' AND name NOT LIKE")) {
+                return tables.map((name) => ({ name }))
+            }
+            if (sql.includes('SELECT sql FROM sqlite_master')) {
+                const match = /name='([^']+)'/.exec(sql)
+                const name = match?.[1] ?? ''
+                return schemas[name] ? [{ sql: schemas[name] }] : []
+            }
+            // rowid-batched data fetch
+            return []
+        })
+    }
+
+    it('completes a small dump in one cycle and writes chunks to R2', async () => {
+        setupTables(['users'], { users: 'CREATE TABLE users (id INTEGER)' })
+        vi.mocked(executeOperation).mockImplementation(async (queries: any) => {
+            const sql: string = queries[0].sql
+            if (sql.includes("name NOT LIKE 'tmp_%'")) {
+                return [{ name: 'users' }]
+            }
+            if (sql.includes('SELECT sql FROM sqlite_master')) {
+                return [{ sql: 'CREATE TABLE users (id INTEGER)' }]
+            }
+            if (sql.includes('WHERE rowid >')) {
+                const since = Number(/rowid > (\d+)/.exec(sql)?.[1] ?? 0)
+                return since === 0
+                    ? [
+                          { __rowid: 1, id: 1 },
+                          { __rowid: 2, id: 2 },
+                      ]
+                    : []
+            }
+            return []
+        })
+
+        const { engine, storage, r2 } = makeEngine()
+        const state = await engine.startDump()
+
+        expect(state.completedAt).toBeDefined()
+        expect(state.phase).toBe('complete')
+        expect(state.totalRows).toBe(2)
+        expect(state.chunkIndex).toBeGreaterThan(0)
+        expect(r2.put).toHaveBeenCalled()
+        // Progress persisted in DO storage for resumability.
+        const persisted = (await storage.get(DUMP_STATE_KEY)) as DumpState | undefined
+        expect(persisted?.completedAt).toBeDefined()
+    })
+
+    it('yields mid-dump when the cycle time budget is exhausted, then resumes', async () => {
+        setupTables(['users'], { users: 'CREATE TABLE users (id INTEGER)' })
+        let call = 0
+        vi.mocked(executeOperation).mockImplementation(async (queries: any) => {
+            const sql: string = queries[0].sql
+            if (sql.includes("name NOT LIKE 'tmp_%'")) return [{ name: 'users' }]
+            if (sql.includes('SELECT sql FROM sqlite_master')) {
+                return [{ sql: 'CREATE TABLE users (id INTEGER)' }]
+            }
+            if (sql.includes('WHERE rowid >')) {
+                const since = Number(/rowid > (\d+)/.exec(sql)?.[1] ?? 0)
+                call++
+                // Yield after every batch: each cycle emits exactly one row,
+                // and the stream is finite (3 rows total).
+                return since < 3 ? [{ __rowid: since + 1, id: since + 1 }] : []
+            }
+            return []
+        })
+
+        // 0ms budget: every data batch closes the cycle → resumable steps.
+        const { engine } = makeEngine({ cycleTimeBudgetMs: 0 })
+        const first = await engine.startDump()
+        expect(first.completedAt).toBeUndefined()
+        expect(['schema', 'table-data']).toContain(first.phase)
+
+        // Resume cycles until complete.
+        let state = first
+        for (let i = 0; i < 50 && !state.completedAt; i++) {
+            state = await engine.runCycle()
+        }
+        expect(state.completedAt).toBeDefined()
+        expect(state.totalRows).toBeGreaterThan(0)
+    })
+
+    it('filters unsafe table names out of the dump plan', async () => {
+        vi.mocked(executeOperation).mockImplementation(async (queries: any) => {
+            const sql: string = queries[0].sql
+            if (sql.includes("name NOT LIKE 'tmp_%'")) {
+                return [
+                    { name: 'good_table' },
+                    { name: 'bad"; DROP TABLE users;--' },
+                ]
+            }
+            if (sql.includes('SELECT sql FROM sqlite_master')) {
+                return [{ sql: 'CREATE TABLE good_table (id INTEGER)' }]
+            }
+            return []
+        })
+
+        const { engine, storage } = makeEngine()
+        const state = await engine.startDump()
+        const persisted = (await storage.get(DUMP_STATE_KEY)) as DumpState | undefined
+        expect(persisted?.tables).toEqual(['good_table'])
+        expect(state.totalRows).toBe(0)
+    })
+
+    it('startDump resumes an in-progress dump instead of restarting', async () => {
+        setupTables(['users'], {})
+        const { engine, storage } = makeEngine({ cycleTimeBudgetMs: 0 })
+        // Seed an in-progress state.
+        const seed: DumpState = {
+            dumpId: 'dump_seed',
+            fileName: 'dump_seed.sql',
+            phase: 'table-data',
+            tables: ['users'],
+            tableIndex: 0,
+            lastFetchedRowId: null,
+            chunkRowOffset: 0,
+            bytesWritten: 0,
+            chunkIndex: 0,
+            startedAt: Date.now() - 1000,
+            updatedAt: Date.now() - 500,
+            totalRows: 0,
+        }
+        await storage.put(DUMP_STATE_KEY, seed)
+
+        vi.mocked(executeOperation).mockImplementation(async (queries: any) => {
+            const sql: string = queries[0].sql
+            if (sql.includes('WHERE rowid >')) return []
+            return []
+        })
+
+        const state = await engine.startDump()
+        // Must NOT have re-planned tables (phase kept, no new dumpId).
+        expect(state.dumpId).toBe('dump_seed')
+        expect(state.tables).toEqual(['users'])
+    })
+
+    it('assembleDump concatenates persisted chunks in order', async () => {
+        const { engine, storage } = makeEngine()
+        const state: DumpState = {
+            dumpId: 'dump_x',
+            fileName: 'dump_x.sql',
+            phase: 'complete',
+            tables: ['t'],
+            tableIndex: 1,
+            lastFetchedRowId: 3,
+            chunkRowOffset: 0,
+            bytesWritten: 10,
+            chunkIndex: 2,
+            startedAt: 1,
+            updatedAt: 2,
+            completedAt: 3,
+            totalRows: 3,
+        }
+        const c0: ChunkRecord = {
+            dumpId: 'dump_x',
+            chunkIndex: 0,
+            content: 'CREATE TABLE t (id INTEGER);\n',
+            bytes: 30,
+            createdAt: 1,
+        }
+        const c1: ChunkRecord = {
+            dumpId: 'dump_x',
+            chunkIndex: 1,
+            content: "INSERT INTO \"t\" (\"id\") VALUES (1);\n",
+            bytes: 35,
+            createdAt: 2,
+        }
+        await storage.put(`${DUMP_CHUNK_KEY}:0`, c0)
+        await storage.put(`${DUMP_CHUNK_KEY}:1`, c1)
+
+        const stream = await engine.assembleDump(state)
+        expect(stream).not.toBeNull()
+        const text = await new Response(stream as ReadableStream).text()
+        expect(text).toContain('CREATE TABLE t')
+        expect(text).toContain('VALUES (1)')
+    })
+
+    it('respects custom rowsPerBatch from options', async () => {
+        let captured = ''
+        vi.mocked(executeOperation).mockImplementation(async (queries: any) => {
+            const sql: string = queries[0].sql
+            if (sql.includes('WHERE rowid >')) {
+                captured = sql
+                return []
+            }
+            if (sql.includes("name NOT LIKE 'tmp_%'")) return [{ name: 'users' }]
+            if (sql.includes('SELECT sql FROM sqlite_master')) {
+                return [{ sql: 'CREATE TABLE users (id INTEGER)' }]
+            }
+            return []
+        })
+        const { engine } = makeEngine({ rowsPerBatch: 42 })
+        await engine.startDump()
+        expect(captured).toContain('LIMIT 42')
+    })
+})

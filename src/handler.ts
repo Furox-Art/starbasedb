@@ -120,8 +120,42 @@ export class StarbaseDB {
         }
 
         if (this.getFeature('export')) {
-            this.app.get('/export/dump', this.isInternalSource, async () => {
+            this.app.get('/export/dump', this.isInternalSource, async (c) => {
+                const url = new URL(c.req.raw.url)
+                const wantsJob = url.searchParams.get('job') === '1'
+
+                if (wantsJob && this.dataSource.source === 'internal') {
+                    // Chunked/resumable job flow runs inside the Durable
+                    // Object via RPC; progress persists across the 30s window.
+                    const searchParams: Record<string, string> = {}
+                    url.searchParams.forEach((value, key) => {
+                        searchParams[key] = value
+                    })
+                    // Narrow RPC view keeps hono's generic inference shallow.
+                    const rpc = this.dataSource.rpc as unknown as {
+                        startDumpJob: (
+                            config: StarbaseDBConfiguration,
+                            searchParams: Record<string, string>
+                        ) => Promise<Response>
+                    }
+                    return await rpc.startDumpJob(this.config, searchParams)
+                }
+
                 return dumpDatabaseRoute(this.dataSource, this.config)
+            })
+
+            this.app.get('/export/dump/status', this.isInternalSource, async () => {
+                if (this.dataSource.source === 'internal') {
+                    const rpc = this.dataSource.rpc as unknown as {
+                        dumpJobStatus: (config: StarbaseDBConfiguration) => Promise<Response>
+                    }
+                    return await rpc.dumpJobStatus(this.config)
+                }
+                return createResponse(
+                    undefined,
+                    'Chunked dump status requires the internal data source',
+                    400
+                )
             })
 
             this.app.get(
