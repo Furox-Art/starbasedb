@@ -27,6 +27,11 @@ export const DEFAULT_DUMP_OPTIONS = {
     rowsPerBatch: 500,
     /** Approximate serialized size (bytes) that closes a chunk. */
     chunkTargetBytes: 512 * 1024,
+    /** Part size for the consolidated R2 multipart upload. R2 (like S3)
+     * requires non-final parts to be at least 5 MiB. */
+    finalizePartSizeBytes: 5 * 1024 * 1024,
+    /** Wall-clock budget per finalize cycle (ms) inside a DO alarm. */
+    finalizeTimeBudgetMs: 20_000,
 } as const
 
 export interface DumpOptions {
@@ -34,6 +39,8 @@ export interface DumpOptions {
     breathingIntervalMs?: number
     rowsPerBatch?: number
     chunkTargetBytes?: number
+    finalizePartSizeBytes?: number
+    finalizeTimeBudgetMs?: number
 }
 
 export type DumpPhase = 'schema' | 'table-data' | 'complete'
@@ -57,6 +64,18 @@ export interface DumpState {
     /** Aggregate stats surfaced in status responses. */
     totalRows: number
     callbackUrl?: string
+
+    /** Consolidated R2 object produced by finalizeDump (multipart upload).
+     * Present once the per-chunk mirrors have been merged into a single
+     * `dumps/<dumpId>/<fileName>` object that supports presigned downloads. */
+    finalObjectKey?: string
+    finalObjectSize?: number
+    finalizedAt?: number
+    /** In-progress multipart bookkeeping: survives eviction so a partially
+     * uploaded finalize can resume without re-uploading completed parts. */
+    finalizeUploadId?: string
+    finalizeParts?: R2UploadedPart[]
+    finalizeBytes?: number
 }
 
 export interface ChunkRecord {
@@ -327,9 +346,192 @@ export class ChunkedDumpEngine {
         return this.options.breathingIntervalMs
     }
 
+    /**
+     * Consolidate all chunk records into a single R2 object via a multipart
+     * upload (`dumps/<dumpId>/<fileName>`), bounded by a time budget so a
+     * multi-GB dump progresses across several DO alarm invocations instead of
+     * one 30s window. Partial progress (uploaded parts + their etags) is
+     * persisted after every part, so an interrupted finalize resumes with
+     * `resumeMultipartUpload` without re-uploading completed parts.
+     *
+     * Returns `{ done: false }` while parts remain; the DO alarm drives the
+     * remaining cycles. Idempotent once `state.finalizedAt` is set.
+     */
+    async finalizeDump(
+        options: { partSizeBytes?: number; timeBudgetMs?: number } = {}
+    ): Promise<{ done: boolean; state: DumpState }> {
+        const state = (await this.storage.get<DumpState>(DUMP_STATE_KEY)) as DumpState
+        if (!state) {
+            throw new Error('No dump in progress')
+        }
+        if (state.finalizedAt) {
+            return { done: true, state }
+        }
+        if (!this.r2) {
+            // Without R2 there is nothing to consolidate; the DO-storage
+            // streaming reassembly remains the download path.
+            state.finalizedAt = Date.now()
+            await this.storage.put(DUMP_STATE_KEY, state)
+            return { done: true, state }
+        }
+        if (!state.completedAt) {
+            return { done: false, state }
+        }
+
+        const partSize = options.partSizeBytes ?? this.options.finalizePartSizeBytes
+        const budget = options.timeBudgetMs ?? this.options.finalizeTimeBudgetMs
+        const key = state.finalObjectKey ?? `dumps/${state.dumpId}/${state.fileName}`
+        const cycleStart = Date.now()
+
+        // Recover the in-flight multipart upload from a previous cycle, or
+        // start a fresh one and persist its uploadId immediately.
+        let mpu: R2MultipartUpload
+        if (state.finalizeUploadId) {
+            mpu = this.r2.resumeMultipartUpload(key, state.finalizeUploadId)
+        } else {
+            mpu = await this.r2.createMultipartUpload(key)
+            state.finalObjectKey = key
+            state.finalizeUploadId = mpu.uploadId
+            state.finalizeParts = []
+            state.finalizeBytes = 0
+            await this.storage.put(DUMP_STATE_KEY, state)
+        }
+
+        const parts = state.finalizeParts ?? []
+        const encoder = new TextEncoder()
+        const persist = async () => {
+            state.finalizeParts = parts
+            state.updatedAt = Date.now()
+            await this.storage.put(DUMP_STATE_KEY, state)
+        }
+
+        // Stream chunk records into part-sized buffers, skipping the bytes
+        // already uploaded as parts in earlier cycles.
+        let skipped = state.finalizeBytes ?? 0
+        let partNumber = parts.length + 1
+        let buffer: Uint8Array[] = []
+        let bufferLen = 0
+
+        for (let i = 0; i < state.chunkIndex; i++) {
+            const record = await this.storage.get<ChunkRecord>(
+                `${DUMP_CHUNK_KEY}:${i}`
+            )
+            if (!record?.content) continue
+            const encoded = encoder.encode(record.content)
+            let data = encoded
+            if (skipped > 0) {
+                if (skipped >= encoded.length) {
+                    skipped -= encoded.length
+                    continue
+                }
+                data = encoded.subarray(skipped)
+                skipped = 0
+            }
+            buffer.push(data)
+            bufferLen += data.length
+
+            // Non-final parts must be >= 5 MiB, so flush only at partSize.
+            if (bufferLen >= partSize) {
+                if (Date.now() - cycleStart >= budget) {
+                    // Out of budget mid-upload: progress (parts + bytes) is
+                    // already persisted, the next cycle continues cleanly.
+                    await persist()
+                    return { done: false, state }
+                }
+                const part = await mpu.uploadPart(
+                    partNumber,
+                    concatUint8(buffer, bufferLen)
+                )
+                parts.push({ partNumber, etag: part.etag })
+                state.finalizeBytes = (state.finalizeBytes ?? 0) + bufferLen
+                await persist()
+                partNumber++
+                buffer = []
+                bufferLen = 0
+            } else if (Date.now() - cycleStart >= budget) {
+                // Budget exhausted while accumulating: the un-uploaded buffer
+                // is rebuilt next cycle from the persisted byte offset.
+                await persist()
+                return { done: false, state }
+            }
+        }
+
+        if (parts.length === 0 && bufferLen === 0) {
+            // Empty dump: nothing to upload, finalize without an object.
+            state.finalizedAt = Date.now()
+            state.updatedAt = state.finalizedAt
+            await this.storage.put(DUMP_STATE_KEY, state)
+            return { done: true, state }
+        }
+
+        // Tail part (allowed to be smaller than partSize).
+        if (bufferLen > 0) {
+            const part = await mpu.uploadPart(
+                partNumber,
+                concatUint8(buffer, bufferLen)
+            )
+            parts.push({ partNumber, etag: part.etag })
+            state.finalizeBytes = (state.finalizeBytes ?? 0) + bufferLen
+        }
+
+        const object = await mpu.complete(parts)
+        state.finalObjectKey = key
+        state.finalObjectSize = object.size ?? state.finalizeBytes
+        state.finalizedAt = Date.now()
+        state.updatedAt = state.finalizedAt
+        state.finalizeUploadId = undefined
+        state.finalizeParts = undefined
+        state.finalizeBytes = undefined
+        await this.storage.put(DUMP_STATE_KEY, state)
+
+        // Best-effort cleanup of the per-chunk R2 mirrors; DO storage records
+        // stay as the streaming fallback.
+        for (let i = 0; i < state.chunkIndex; i++) {
+            try {
+                await this.r2.delete(
+                    `${state.dumpId}/${String(i).padStart(8, '0')}.sql`
+                )
+            } catch {
+                // Cleanup is best-effort; leftover mirrors are harmless.
+            }
+        }
+        return { done: true, state }
+    }
+
+    /**
+     * Presigned download URL for the finalized object. Presigned URL
+     * generation is feature-detected: newer workerd runtimes expose
+     * `R2Bucket.createSignedUrl`, older bindings do not — in that case the
+     * caller falls back to the streaming reassembly endpoint.
+     */
+    async getPresignedUrl(expiresInSeconds = 3600): Promise<string | null> {
+        const state = (await this.storage.get<DumpState>(DUMP_STATE_KEY)) as DumpState
+        if (!state?.finalObjectKey || !this.r2) return null
+        const creator = (
+            this.r2 as R2Bucket & { createSignedUrl?: R2SignedUrlCreator }
+        ).createSignedUrl
+        if (typeof creator !== 'function') return null
+        try {
+            const signed = await creator.call(
+                this.r2,
+                state.finalObjectKey,
+                expiresInSeconds
+            )
+            return signed?.url ?? null
+        } catch {
+            return null
+        }
+    }
+
     /** Reassemble the dump from chunk records (or R2 when bound). */
     async assembleDump(state: DumpState): Promise<ReadableStream<Uint8Array> | null> {
         if (!state.completedAt) return null
+
+        // Prefer the consolidated multipart object when finalization ran.
+        if (state.finalObjectKey && this.r2) {
+            const final = await this.r2.get(state.finalObjectKey)
+            if (final?.body) return final.body
+        }
 
         if (this.r2) {
             const stream = await this.concatenateR2(state)
@@ -369,6 +571,25 @@ export class ChunkedDumpEngine {
         }
         return concatStreams(parts)
     }
+}
+
+/**
+ * Feature-detected presigned URL creator exposed by newer R2 runtime
+ * bindings (`R2Bucket.createSignedUrl`).
+ */
+type R2SignedUrlCreator = (
+    key: string,
+    expiresInSeconds: number
+) => Promise<{ url?: string } | null>
+
+function concatUint8(chunks: Uint8Array[], totalLength: number): Uint8Array {
+    const out = new Uint8Array(totalLength)
+    let offset = 0
+    for (const chunk of chunks) {
+        out.set(chunk, offset)
+        offset += chunk.length
+    }
+    return out
 }
 
 function concatStreams(streams: ReadableStream<Uint8Array>[]): ReadableStream<Uint8Array> {

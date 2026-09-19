@@ -133,6 +133,24 @@ export class StarbaseDBDurableObject extends DurableObject {
                 return
             }
 
+            // A finished dump that has not been consolidated yet: merge its
+            // chunk records into the single R2 object (multipart, resumable)
+            // so presigned download URLs become available.
+            if (dumpState && dumpState.completedAt && !dumpState.finalizedAt) {
+                const { runDumpFinalize } = await import('./export/dump')
+                await runDumpFinalize({
+                    storage: this.storage,
+                    env: {
+                        R2_DUMP_BUCKET: (this.env as Env & { R2_DUMP_BUCKET?: R2Bucket })
+                            .R2_DUMP_BUCKET,
+                    },
+                    dataSource: this.dumpJobDataSource(),
+                    config: { role: 'admin' } as StarbaseDBConfiguration,
+                    setAlarm: (time, options) => this.setAlarm(time, options),
+                })
+                return
+            }
+
             // Fetch all the tasks that are marked to emit an event for this cycle.
             const task = (await this.executeQuery({
                 sql: 'SELECT * FROM tmp_cron_tasks WHERE is_active = 1;',

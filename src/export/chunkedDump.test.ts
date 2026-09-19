@@ -303,3 +303,263 @@ describe('ChunkedDumpEngine cycles', () => {
         expect(captured).toContain('LIMIT 42')
     })
 })
+
+// ---------------------------------------------------------------------------
+// R2 multipart finalize + presigned URL
+// ---------------------------------------------------------------------------
+
+type UploadedPart = { partNumber: number; etag: string }
+
+const makeMultipartR2 = () => {
+    const uploaded: { partNumber: number; size: number }[] = []
+    let completed: UploadedPart[] | null = null
+    let resumedWith: string | null = null
+    let createdFor: string | null = null
+    let signedUrlResult: { url?: string } | null | undefined = undefined
+    const deletedKeys: string[] = []
+    const objects = new Map<string, { body: ReadableStream<Uint8Array> }>()
+
+    const mpu = {
+        key: '',
+        uploadId: 'mpu-1',
+        uploadPart: async (partNumber: number, value: Uint8Array) => {
+            uploaded.push({ partNumber, size: value.length })
+            return { partNumber, etag: `etag-${partNumber}` }
+        },
+        abort: async () => undefined,
+        complete: async (parts: UploadedPart[]) => {
+            completed = parts
+            const total = uploaded.reduce((sum, p) => sum + p.size, 0)
+            return { key: mpu.key, size: total }
+        },
+    }
+
+    const r2 = {
+        createMultipartUpload: async (key: string) => {
+            createdFor = key
+            mpu.key = key
+            return mpu
+        },
+        resumeMultipartUpload: (key: string, uploadId: string) => {
+            resumedWith = uploadId
+            mpu.key = key
+            return mpu
+        },
+        put: async () => undefined,
+        get: async (key: string) => objects.get(key) ?? null,
+        delete: async (key: string) => {
+            deletedKeys.push(key)
+        },
+    }
+    return { r2, uploaded, deleted: () => deletedKeys, completed: () => completed, resumedWith: () => resumedWith, createdFor: () => createdFor, objects, signedUrlResult: () => signedUrlResult, setSigned: (v: { url?: string } | null | undefined) => { signedUrlResult = v } }
+}
+
+const seedCompletedState = async (
+    storage: ReturnType<typeof makeStorage>,
+    chunks: string[],
+    extra: Partial<DumpState> = {}
+) => {
+    const state: DumpState = {
+        dumpId: 'dump_fin',
+        fileName: 'dump_fin.sql',
+        phase: 'complete',
+        tables: ['t'],
+        tableIndex: 1,
+        lastFetchedRowId: null,
+        chunkRowOffset: 0,
+        bytesWritten: chunks.join('').length,
+        chunkIndex: chunks.length,
+        startedAt: 1,
+        updatedAt: 2,
+        completedAt: 3,
+        totalRows: 0,
+        ...extra,
+    }
+    for (let i = 0; i < chunks.length; i++) {
+        const record: ChunkRecord = {
+            dumpId: 'dump_fin',
+            chunkIndex: i,
+            content: chunks[i],
+            bytes: chunks[i].length,
+            createdAt: i,
+        }
+        await storage.put(`${DUMP_CHUNK_KEY}:${i}`, record)
+    }
+    await storage.put(DUMP_STATE_KEY, state)
+    return state
+}
+
+describe('finalizeDump (R2 multipart upload + presigned URL)', () => {
+    it('uploads part-sized parts, completes the object and cleans chunk mirrors', async () => {
+        const storage = makeStorage()
+        const m = makeMultipartR2()
+        // 4 chunks of 10 bytes each; partSize 20 → parts of 20, 20, 20(tail).
+        await seedCompletedState(storage, ['AAAAAAAAAA', 'BBBBBBBBBB', 'CCCCCCCCCC', 'DDDDDDDDDD'])
+        const engine = new ChunkedDumpEngine(
+            storage as unknown as DurableObjectStorage,
+            m.r2 as unknown as R2Bucket,
+            makeDataSource(),
+            makeConfig(),
+            { ...DEFAULT_DUMP_OPTIONS }
+        )
+        const { done, state } = await engine.finalizeDump({ partSizeBytes: 20 })
+
+        expect(done).toBe(true)
+        expect(m.createdFor()).toBe('dumps/dump_fin/dump_fin.sql')
+        // 40 bytes at partSize 20 → exactly two full parts, no tail.
+        expect(m.uploaded.map((p) => p.size)).toEqual([20, 20])
+        expect(m.uploaded.map((p) => p.partNumber)).toEqual([1, 2])
+        expect(m.completed()?.length).toBe(2)
+        expect(state.finalObjectKey).toBe('dumps/dump_fin/dump_fin.sql')
+        expect(state.finalObjectSize).toBe(40)
+        expect(state.finalizedAt).toBeDefined()
+        // Per-chunk R2 mirrors are cleaned up after a successful complete.
+        expect(m.deleted().length).toBe(4)
+    })
+
+    it('resumes an interrupted finalize without re-uploading completed parts', async () => {
+        const storage = makeStorage()
+        const m = makeMultipartR2()
+        const chunks = ['AAAAAAAAAA', 'BBBBBBBBBB', 'CCCCCCCCCC', 'DDDDDDDDDD']
+        // First part (chunk 0 + chunk 1 = 20 bytes) already uploaded.
+        await seedCompletedState(storage, chunks, {
+            finalObjectKey: 'dumps/dump_fin/dump_fin.sql',
+            finalizeUploadId: 'mpu-9',
+            finalizeParts: [{ partNumber: 1, etag: 'etag-1' }],
+            finalizeBytes: 20,
+        })
+        const engine = new ChunkedDumpEngine(
+            storage as unknown as DurableObjectStorage,
+            m.r2 as unknown as R2Bucket,
+            makeDataSource(),
+            makeConfig(),
+            { ...DEFAULT_DUMP_OPTIONS }
+        )
+        const { done } = await engine.finalizeDump({ partSizeBytes: 20 })
+
+        expect(done).toBe(true)
+        expect(m.resumedWith()).toBe('mpu-9')
+        // Only the remaining 20 bytes upload, as part 2 — no re-upload.
+        expect(m.uploaded).toEqual([{ partNumber: 2, size: 20 }])
+        expect(m.completed()?.length).toBe(2)
+    })
+
+    it('returns done:false when the time budget runs out mid-upload, then finishes on the next cycle', async () => {
+        const storage = makeStorage()
+        const m = makeMultipartR2()
+        await seedCompletedState(storage, ['AAAAAAAAAA', 'BBBBBBBBBB', 'CCCCCCCCCC', 'DDDDDDDDDD'])
+        const engine = new ChunkedDumpEngine(
+            storage as unknown as DurableObjectStorage,
+            m.r2 as unknown as R2Bucket,
+            makeDataSource(),
+            makeConfig(),
+            { ...DEFAULT_DUMP_OPTIONS }
+        )
+        const first = await engine.finalizeDump({ partSizeBytes: 20, timeBudgetMs: -1 })
+        expect(first.done).toBe(false)
+        expect(first.state.finalizeUploadId).toBe('mpu-1')
+
+        const second = await engine.finalizeDump({ partSizeBytes: 20 })
+        expect(second.done).toBe(true)
+        expect(second.state.finalizedAt).toBeDefined()
+    })
+
+    it('finalizes without R2 binding (streaming-only environments)', async () => {
+        const storage = makeStorage()
+        await seedCompletedState(storage, ['data'])
+        const engine = new ChunkedDumpEngine(
+            storage as unknown as DurableObjectStorage,
+            undefined as unknown as R2Bucket,
+            makeDataSource(),
+            makeConfig(),
+            { ...DEFAULT_DUMP_OPTIONS }
+        )
+        const { done, state } = await engine.finalizeDump()
+        expect(done).toBe(true)
+        expect(state.finalObjectKey).toBeUndefined()
+        expect(state.finalizedAt).toBeDefined()
+    })
+
+    it('getPresignedUrl returns the signed URL when the runtime supports createSignedUrl', async () => {
+        const storage = makeStorage()
+        const m = makeMultipartR2()
+        await seedCompletedState(storage, ['data'], {
+            finalObjectKey: 'dumps/dump_fin/dump_fin.sql',
+            finalizedAt: 9,
+        })
+        m.setSigned({ url: 'https://signed.example/dump?sig=abc' })
+        const r2 = Object.assign(m.r2, {
+            createSignedUrl: async () => (m.signedUrlResult() as { url?: string }),
+        })
+        const engine = new ChunkedDumpEngine(
+            storage as unknown as DurableObjectStorage,
+            r2 as unknown as R2Bucket,
+            makeDataSource(),
+            makeConfig(),
+            { ...DEFAULT_DUMP_OPTIONS }
+        )
+        const url = await engine.getPresignedUrl(600)
+        expect(url).toBe('https://signed.example/dump?sig=abc')
+    })
+
+    it('getPresignedUrl returns null when the binding lacks createSignedUrl or the URL shape is unexpected', async () => {
+        const storage = makeStorage()
+        const m = makeMultipartR2()
+        await seedCompletedState(storage, ['data'], {
+            finalObjectKey: 'dumps/dump_fin/dump_fin.sql',
+            finalizedAt: 9,
+        })
+        // Older binding: no createSignedUrl at all.
+        const engineA = new ChunkedDumpEngine(
+            storage as unknown as DurableObjectStorage,
+            m.r2 as unknown as R2Bucket,
+            makeDataSource(),
+            makeConfig(),
+            { ...DEFAULT_DUMP_OPTIONS }
+        )
+        await expect(engineA.getPresignedUrl()).resolves.toBeNull()
+
+        // Unexpected result shape (missing url) must not throw.
+        m.setSigned({})
+        const r2 = Object.assign(m.r2, {
+            createSignedUrl: async () => (m.signedUrlResult() as { url?: string }),
+        })
+        const engineB = new ChunkedDumpEngine(
+            storage as unknown as DurableObjectStorage,
+            r2 as unknown as R2Bucket,
+            makeDataSource(),
+            makeConfig(),
+            { ...DEFAULT_DUMP_OPTIONS }
+        )
+        await expect(engineB.getPresignedUrl()).resolves.toBeNull()
+    })
+
+    it('assembleDump prefers the consolidated final object', async () => {
+        const storage = makeStorage()
+        const m = makeMultipartR2()
+        await seedCompletedState(storage, ['chunk-content'], {
+            finalObjectKey: 'dumps/dump_fin/dump_fin.sql',
+            finalizedAt: 9,
+        })
+        const bytes = new TextEncoder().encode('CONSOLIDATED')
+        m.objects.set('dumps/dump_fin/dump_fin.sql', {
+            body: new ReadableStream<Uint8Array>({
+                start(c) {
+                    c.enqueue(bytes)
+                    c.close()
+                },
+            }),
+        })
+        const engine = new ChunkedDumpEngine(
+            storage as unknown as DurableObjectStorage,
+            m.r2 as unknown as R2Bucket,
+            makeDataSource(),
+            makeConfig(),
+            { ...DEFAULT_DUMP_OPTIONS }
+        )
+        const state = (await storage.get(DUMP_STATE_KEY)) as DumpState
+        const stream = await engine.assembleDump(state)
+        const text = await new Response(stream as ReadableStream).text()
+        expect(text).toBe('CONSOLIDATED')
+    })
+})

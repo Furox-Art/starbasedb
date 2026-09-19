@@ -50,6 +50,8 @@ export function parseDumpOptions(searchParams: URLSearchParams): DumpOptions {
     readNumber('breathMs', 'breathingIntervalMs')
     readNumber('rows', 'rowsPerBatch')
     readNumber('chunkBytes', 'chunkTargetBytes')
+    readNumber('partBytes', 'finalizePartSizeBytes')
+    readNumber('finalizeMs', 'finalizeTimeBudgetMs')
     return options
 }
 
@@ -154,6 +156,16 @@ export async function runDumpJob(
         }
 
         if (state.completedAt) {
+            // Kick off the R2 multipart consolidation (presigned-URL-ready
+            // single object) asynchronously via the DO alarm; the response
+            // below streams from the chunk records either way.
+            if (host.env.R2_DUMP_BUCKET && !state.finalizedAt) {
+                try {
+                    await host.setAlarm(Date.now() + 1_000)
+                } catch (alarmError) {
+                    console.error('Failed to schedule dump finalize:', alarmError)
+                }
+            }
             const stream = await engine.assembleDump(state)
             if (stream) {
                 return new Response(stream, {
@@ -231,6 +243,28 @@ export async function dumpJobStatus(
             202
         )
     }
+    // Completed + consolidated: prefer a presigned, expiring download URL
+    // when the runtime supports it; otherwise fall back to streaming.
+    if (state.finalObjectKey) {
+        const downloadUrl = await engine.getPresignedUrl()
+        if (downloadUrl) {
+            return createResponse(
+                {
+                    dumpId: state.dumpId,
+                    status: 'complete',
+                    downloadUrl,
+                    downloadUrlExpiresInSeconds: 3600,
+                    downloadType: 'presigned-url',
+                    finalObjectKey: state.finalObjectKey,
+                    size: state.finalObjectSize ?? state.bytesWritten,
+                    totalRows: state.totalRows,
+                    fileName: state.fileName,
+                },
+                undefined,
+                200
+            )
+        }
+    }
     const stream = await engine.assembleDump(state)
     if (!stream) {
         return createResponse(undefined, 'Dump data unavailable', 410)
@@ -241,6 +275,25 @@ export async function dumpJobStatus(
             'Content-Disposition': `attachment; filename="${state.fileName}"`,
         },
     })
+}
+
+/**
+ * One bounded finalize cycle for the completed dump: consolidates chunks
+ * into the single R2 object via multipart upload. Driven by the DO alarm;
+ * reschedules itself while parts remain (`{ done: false }`).
+ */
+export async function runDumpFinalize(host: DumpEngineHost): Promise<void> {
+    const engine = new ChunkedDumpEngine(
+        host.storage,
+        host.env.R2_DUMP_BUCKET,
+        host.dataSource,
+        host.config,
+        DEFAULT_DUMP_OPTIONS
+    )
+    const { done } = await engine.finalizeDump()
+    if (!done) {
+        await host.setAlarm(Date.now() + 1_000)
+    }
 }
 
 export async function dumpDatabaseRoute(
