@@ -293,7 +293,7 @@ describe('ChunkedDumpEngine cycles', () => {
             phase: 'table-data',
             tables: ['users'],
             tableIndex: 0,
-            lastFetchedRowId: null,
+            lastFetchedRowId: 3,
             chunkRowOffset: 0,
             bytesWritten: 0,
             chunkIndex: 0,
@@ -303,16 +303,23 @@ describe('ChunkedDumpEngine cycles', () => {
         }
         await storage.put(DUMP_STATE_KEY, seed)
 
+        let dataSql = ''
+        let dataParams: unknown[] = []
         vi.mocked(executeOperation).mockImplementation(async (queries: any) => {
             const sql: string = queries[0].sql
-            if (sql.includes('ORDER BY')) return []
+            if (sql.includes('ORDER BY')) {
+                dataSql = sql
+                dataParams = queries[0].params ?? []
+                return []
+            }
             return []
         })
 
         const state = await engine.startDump()
-        // Must NOT have re-planned tables (phase kept, no new dumpId).
         expect(state.dumpId).toBe('dump_seed')
         expect(state.tables).toEqual(['users'])
+        expect(dataSql).toContain('WHERE "rowid" > ?')
+        expect(dataParams).toEqual([3])
     })
 
     it('assembleDump concatenates persisted chunks in order', async () => {

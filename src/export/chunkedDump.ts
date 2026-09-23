@@ -318,19 +318,32 @@ export class ChunkedDumpEngine {
 
         while (state.tableIndex < state.tables.length) {
             const table = state.tables[state.tableIndex]
+            const hasLegacyRowIdCursor =
+                state.currentTable === undefined &&
+                state.cursorMode === undefined &&
+                state.lastFetchedRowId !== null
             if (state.currentTable !== table) {
                 state.currentTable = table
                 state.cursorMode = undefined
                 state.cursorColumns = undefined
                 state.cursorAliases = undefined
                 state.cursorValues = null
-                state.lastFetchedRowId = null
+                if (!hasLegacyRowIdCursor) {
+                    state.lastFetchedRowId = null
+                }
             }
 
             const plan = await this.resolveTableCursor(table, state)
             const aliases = state.cursorAliases ?? plan.aliases
             const cursorColumns = state.cursorColumns ?? plan.columns
-            const cursorValues = state.cursorValues
+            const cursorValues =
+                state.cursorValues ??
+                (state.cursorMode === 'rowid' && state.lastFetchedRowId !== null
+                    ? [state.lastFetchedRowId]
+                    : null)
+            if (cursorValues && !state.cursorValues) {
+                state.cursorValues = cursorValues
+            }
             const limit = Math.max(1, Math.floor(this.options.rowsPerBatch))
             const selectedCursorColumns = cursorColumns
                 .map(
