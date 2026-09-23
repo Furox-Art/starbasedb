@@ -5,25 +5,15 @@ import { createResponse } from '../utils'
 import {
     ChunkedDumpEngine,
     DEFAULT_DUMP_OPTIONS,
+    quoteIdentifier,
+    sqlCommentLabel,
+    isSafeIdentifier,
     type DumpOptions,
-    type DumpState,
 } from './chunkedDump'
 
-/**
- * Dump route.
- *
- * Small databases keep the legacy behavior: the dump is fully serialized and
- * returned inline as a downloadable file (well under the 30s window).
- *
- * Large databases exceed the 30s Workers request window, so `?job=1` opts
- * into a resumable job flow driven inside the Durable Object: bounded work
- * cycles with breathing intervals, progress persisted in DO storage, chunks
- * mirrored to R2 when the binding exists, the DO alarm resuming work across
- * window boundaries, and an optional `callbackUrl` invoked on completion.
- */
+export const AUTO_JOB_THRESHOLD_BYTES = 8 * 1024 * 1024
 
 export interface DumpJobEnv {
-    /** Optional R2 binding; when absent, chunks persist in DO storage only. */
     R2_DUMP_BUCKET?: R2Bucket
 }
 
@@ -32,10 +22,12 @@ export interface DumpEngineHost {
     env: DumpJobEnv
     dataSource: DataSource
     config: StarbaseDBConfiguration
-    setAlarm: (time: number, options?: DurableObjectSetAlarmOptions) => Promise<void>
+    setAlarm: (
+        time: number,
+        options?: DurableObjectSetAlarmOptions
+    ) => Promise<void>
 }
 
-/** Query param parsing: `cycleMs`, `breathMs`, `rows`, `chunkBytes`. */
 export function parseDumpOptions(searchParams: URLSearchParams): DumpOptions {
     const options: DumpOptions = {}
     const readNumber = (key: string, target: keyof DumpOptions) => {
@@ -55,7 +47,26 @@ export function parseDumpOptions(searchParams: URLSearchParams): DumpOptions {
     return options
 }
 
-/** Legacy inline dump path, behavior-identical for small databases. */
+function legacyIdentifier(name: string): string {
+    return isSafeIdentifier(name) ? name : quoteIdentifier(name)
+}
+
+function legacyValue(value: unknown): string {
+    if (value === null || value === undefined) return 'NULL'
+    if (typeof value === 'number')
+        return Number.isFinite(value) ? String(value) : 'NULL'
+    if (typeof value === 'bigint' || typeof value === 'boolean')
+        return String(value)
+    if (value instanceof ArrayBuffer) {
+        return `X'${Array.from(new Uint8Array(value), (b) => b.toString(16).padStart(2, '0')).join('')}'`
+    }
+    if (ArrayBuffer.isView(value)) {
+        return `X'${Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength), (b) => b.toString(16).padStart(2, '0')).join('')}'`
+    }
+    if (typeof value === 'string') return `'${value.replace(/'/g, "''")}'`
+    return `'${(JSON.stringify(value) ?? String(value)).replace(/'/g, "''")}'`
+}
+
 export async function legacyDump(
     dataSource: DataSource,
     config: StarbaseDBConfiguration
@@ -67,48 +78,48 @@ export async function legacyDump(
             config
         )
 
-        const tables = tablesResult.map((row: any) => row.name)
-        let dumpContent = 'SQLite format 3\0' // SQLite file header
+        const tables = tablesResult
+            .map((row: Record<string, unknown>) => String(row.name))
+            .filter((name: string) => name.length > 0)
+        let dumpContent = 'SQLite format 3\0'
 
         for (const table of tables) {
             const schemaResult = await executeOperation(
-                [{
-                    sql: `SELECT sql FROM sqlite_master WHERE type='table' AND name='${table}';`,
-                }],
+                [
+                    {
+                        sql: "SELECT sql FROM sqlite_master WHERE type='table' AND name=?;",
+                        params: [table],
+                    },
+                ],
                 dataSource,
                 config
             )
 
-            if (schemaResult.length) {
-                const schema = schemaResult[0].sql
-                dumpContent += `\n-- Table: ${table}\n${schema};\n\n`
+            if (schemaResult.length && schemaResult[0]?.sql) {
+                dumpContent += `\n-- Table: ${sqlCommentLabel(table)}\n${String(schemaResult[0].sql)};\n\n`
             }
 
             const dataResult = await executeOperation(
-                [{ sql: `SELECT * FROM ${table};` }],
+                [{ sql: `SELECT * FROM ${quoteIdentifier(table)};` }],
                 dataSource,
                 config
             )
 
             for (const row of dataResult) {
                 const values = Object.values(row).map((value) =>
-                    typeof value === 'string'
-                        ? `'${value.replace(/'/g, "''")}'`
-                        : value
+                    legacyValue(value)
                 )
-                dumpContent += `INSERT INTO ${table} VALUES (${values.join(', ')});\n`
+                dumpContent += `INSERT INTO ${legacyIdentifier(table)} VALUES (${values.join(', ')});\n`
             }
 
             dumpContent += '\n'
         }
 
         const blob = new Blob([dumpContent], { type: 'application/x-sqlite3' })
-
         const headers = new Headers({
             'Content-Type': 'application/x-sqlite3',
             'Content-Disposition': 'attachment; filename="database_dump.sql"',
         })
-
         return new Response(blob, { headers })
     } catch (error: any) {
         console.error('Database Dump Error:', error)
@@ -116,54 +127,68 @@ export async function legacyDump(
     }
 }
 
-/**
- * Chunked job dump, executed inside the Durable Object. Runs bounded cycles
- * within the current request, schedules the alarm for the next breathing
- * interval when work remains, and returns either the finished dump stream or
- * a 202 progress payload.
- */
+export async function shouldUseResumableDump(
+    dataSource: DataSource,
+    config: StarbaseDBConfiguration
+): Promise<boolean> {
+    try {
+        const readPragma = async (sql: string): Promise<number> => {
+            const result = await executeOperation([{ sql }], dataSource, config)
+            const row = result[0] as Record<string, unknown> | undefined
+            const value = row ? Object.values(row)[0] : undefined
+            const number = Number(value)
+            return Number.isFinite(number) ? number : 0
+        }
+        const pageCount = await readPragma('PRAGMA page_count;')
+        const pageSize = await readPragma('PRAGMA page_size;')
+        return pageCount * pageSize >= AUTO_JOB_THRESHOLD_BYTES
+    } catch {
+        return true
+    }
+}
+
 export async function runDumpJob(
     host: DumpEngineHost,
     searchParams: URLSearchParams,
     requestStart: number = Date.now()
 ): Promise<Response> {
     try {
-        const options = parseDumpOptions(searchParams)
+        const parsedOptions = parseDumpOptions(searchParams)
+        const options = { ...DEFAULT_DUMP_OPTIONS, ...parsedOptions }
         const engine = new ChunkedDumpEngine(
             host.storage,
             host.env.R2_DUMP_BUCKET,
             host.dataSource,
             host.config,
-            { ...DEFAULT_DUMP_OPTIONS, ...options }
+            options
         )
 
         let state = await engine.getState()
-        if (!state || state.completedAt) {
-            state = await engine.startDump(
-                searchParams.get('callbackUrl') ?? undefined
-            )
-        } else {
+        if (!state) {
+            state = await engine.startDump()
+        } else if (!state.completedAt) {
             state = await engine.runCycle()
         }
 
-        // Keep working while this request still has budget (5s default cycle
-        // budget bounds each burst; breathing happens between bursts).
         while (
             !state.completedAt &&
-            Date.now() - requestStart < DEFAULT_DUMP_OPTIONS.cycleTimeBudgetMs
+            Date.now() - requestStart < options.cycleTimeBudgetMs
         ) {
             state = await engine.runCycle()
         }
 
         if (state.completedAt) {
-            // Kick off the R2 multipart consolidation (presigned-URL-ready
-            // single object) asynchronously via the DO alarm; the response
-            // below streams from the chunk records either way.
-            if (host.env.R2_DUMP_BUCKET && !state.finalizedAt) {
+            if (
+                host.env.R2_DUMP_BUCKET &&
+                (!state.finalizedAt || !state.temporaryChunksCleanedAt)
+            ) {
                 try {
                     await host.setAlarm(Date.now() + 1_000)
                 } catch (alarmError) {
-                    console.error('Failed to schedule dump finalize:', alarmError)
+                    console.error(
+                        'Failed to schedule dump finalize:',
+                        alarmError
+                    )
                 }
             }
             const stream = await engine.assembleDump(state)
@@ -177,10 +202,8 @@ export async function runDumpJob(
             }
         }
 
-        // Work remains: breathe, then let the DO alarm drive the next cycle.
-        const resumeAt = Date.now() + DEFAULT_DUMP_OPTIONS.breathingIntervalMs
+        const resumeAt = Date.now() + options.breathingIntervalMs
         await host.setAlarm(resumeAt)
-
         return createResponse(
             {
                 dumpId: state.dumpId,
@@ -205,14 +228,7 @@ export async function runDumpJob(
     }
 }
 
-/**
- * Status + fetch endpoint for in-progress/completed chunked dumps.
- * `GET /export/dump?job=1` while a job runs returns 202 progress; once the
- * job is complete the assembled dump streams back.
- */
-export async function dumpJobStatus(
-    host: DumpEngineHost
-): Promise<Response> {
+export async function dumpJobStatus(host: DumpEngineHost): Promise<Response> {
     const engine = new ChunkedDumpEngine(
         host.storage,
         host.env.R2_DUMP_BUCKET,
@@ -243,8 +259,6 @@ export async function dumpJobStatus(
             202
         )
     }
-    // Completed + consolidated: prefer a presigned, expiring download URL
-    // when the runtime supports it; otherwise fall back to streaming.
     if (state.finalObjectKey) {
         const downloadUrl = await engine.getPresignedUrl()
         if (downloadUrl) {
@@ -277,11 +291,6 @@ export async function dumpJobStatus(
     })
 }
 
-/**
- * One bounded finalize cycle for the completed dump: consolidates chunks
- * into the single R2 object via multipart upload. Driven by the DO alarm;
- * reschedules itself while parts remain (`{ done: false }`).
- */
 export async function runDumpFinalize(host: DumpEngineHost): Promise<void> {
     const engine = new ChunkedDumpEngine(
         host.storage,

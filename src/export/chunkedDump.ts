@@ -2,35 +2,15 @@ import { DataSource } from '../types'
 import { StarbaseDBConfiguration } from '../handler'
 import { executeOperation } from './index'
 
-/**
- * Chunked, resumable database dumps with "breathing intervals".
- *
- * The legacy dump endpoint accumulated the entire database into a single
- * in-memory string, which fails on large databases and blows through the
- * 30s Workers request window. This module writes the dump in bounded chunks,
- * yielding ("breathing") between chunks so queued requests are not starved,
- * persists progress in DO storage so work can resume across the 30s window
- * (driven by the DO alarm), and mirrors every chunk to R2 when a binding is
- * available so dumps survive eviction and can be fetched after completion.
- */
-
 export const DUMP_STATE_KEY = 'tmp_dump_state'
 export const DUMP_CHUNK_KEY = 'tmp_dump_chunk'
 
-/** Defaults tuned to stay far under the 30s request window per cycle. */
 export const DEFAULT_DUMP_OPTIONS = {
-    /** Wall-clock budget per work cycle (ms) before we breathe/yield. */
     cycleTimeBudgetMs: 5_000,
-    /** Minimum idle time between cycles when requests are waiting. */
     breathingIntervalMs: 5_000,
-    /** Maximum rows fetched per SELECT batch. */
     rowsPerBatch: 500,
-    /** Approximate serialized size (bytes) that closes a chunk. */
     chunkTargetBytes: 512 * 1024,
-    /** Part size for the consolidated R2 multipart upload. R2 (like S3)
-     * requires non-final parts to be at least 5 MiB. */
     finalizePartSizeBytes: 5 * 1024 * 1024,
-    /** Wall-clock budget per finalize cycle (ms) inside a DO alarm. */
     finalizeTimeBudgetMs: 20_000,
 } as const
 
@@ -44,6 +24,8 @@ export interface DumpOptions {
 }
 
 export type DumpPhase = 'schema' | 'table-data' | 'complete'
+export type DumpCursorMode = 'rowid' | 'primary-key'
+export type DumpCursorValue = string | number | bigint | null
 
 export interface DumpState {
     dumpId: string
@@ -52,53 +34,58 @@ export interface DumpState {
     tables: string[]
     tableIndex: number
     lastFetchedRowId: number | null
-    /** Rowid of the last row written into the current chunk. */
     chunkRowOffset: number
-    /** Total bytes serialized so far (chunks flushed to R2). */
     bytesWritten: number
     chunkIndex: number
     startedAt: number
     updatedAt: number
-    /** Set when the dump finished and the R2 object is ready. */
     completedAt?: number
-    /** Aggregate stats surfaced in status responses. */
     totalRows: number
-    callbackUrl?: string
-
-    /** Consolidated R2 object produced by finalizeDump (multipart upload).
-     * Present once the per-chunk mirrors have been merged into a single
-     * `dumps/<dumpId>/<fileName>` object that supports presigned downloads. */
     finalObjectKey?: string
     finalObjectSize?: number
     finalizedAt?: number
-    /** In-progress multipart bookkeeping: survives eviction so a partially
-     * uploaded finalize can resume without re-uploading completed parts. */
     finalizeUploadId?: string
     finalizeParts?: R2UploadedPart[]
     finalizeBytes?: number
+    currentTable?: string
+    cursorMode?: DumpCursorMode
+    cursorColumns?: string[]
+    cursorAliases?: string[]
+    cursorValues?: DumpCursorValue[] | null
+    temporaryChunksCleanedAt?: number
 }
 
 export interface ChunkRecord {
     dumpId: string
     chunkIndex: number
-    /** Serialized SQL statements for this chunk. */
     content: string
     bytes: number
     createdAt: number
 }
 
 const IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
+const CURSOR_ALIAS_PREFIX = '__starbase_dump_cursor_'
 
-/** Guard against SQL injection through table names coming from sqlite_master. */
 export function isSafeIdentifier(name: string): boolean {
     return IDENTIFIER_PATTERN.test(name)
+}
+
+export function quoteIdentifier(name: string): string {
+    return `"${name.replace(/"/g, '""')}"`
+}
+
+export function sqlCommentLabel(value: string): string {
+    return value.replace(/[\r\n]/g, ' ')
 }
 
 function sqlQuote(value: unknown): string {
     if (value === null || value === undefined) {
         return 'NULL'
     }
-    if (typeof value === 'number' || typeof value === 'boolean') {
+    if (typeof value === 'number') {
+        return Number.isFinite(value) ? String(value) : 'NULL'
+    }
+    if (typeof value === 'bigint' || typeof value === 'boolean') {
         return String(value)
     }
     if (value instanceof ArrayBuffer) {
@@ -106,25 +93,32 @@ function sqlQuote(value: unknown): string {
             b.toString(16).padStart(2, '0')
         ).join('')}'`
     }
+    if (ArrayBuffer.isView(value)) {
+        return `X'${Array.from(
+            new Uint8Array(value.buffer, value.byteOffset, value.byteLength),
+            (b) => b.toString(16).padStart(2, '0')
+        ).join('')}'`
+    }
     if (typeof value === 'string') {
         return `'${value.replace(/'/g, "''")}'`
     }
-    // Fallback: serialize deterministically rather than emitting "object".
-    return `'${JSON.stringify(value).replace(/'/g, "''")}'`
+    const serialized = JSON.stringify(value)
+    return `'${(serialized ?? String(value)).replace(/'/g, "''")}'`
 }
 
 export function serializeRows(
     table: string,
-    rows: Record<string, unknown>[]
+    rows: Record<string, unknown>[],
+    columns?: string[]
 ): { content: string; rowCount: number } {
     if (rows.length === 0) {
         return { content: '', rowCount: 0 }
     }
-    const columns = Object.keys(rows[0])
-    const columnList = columns.map((c) => `"${c}"`).join(', ')
+    const selectedColumns = columns ?? Object.keys(rows[0])
+    const columnList = selectedColumns.map((c) => quoteIdentifier(c)).join(', ')
     const lines = rows.map((row) => {
-        const values = columns.map((c) => sqlQuote(row[c]))
-        return `INSERT INTO "${table}" (${columnList}) VALUES (${values.join(', ')});`
+        const values = selectedColumns.map((c) => sqlQuote(row[c]))
+        return `INSERT INTO ${quoteIdentifier(table)} (${columnList}) VALUES (${values.join(', ')});`
     })
     return { content: `${lines.join('\n')}\n`, rowCount: rows.length }
 }
@@ -137,14 +131,58 @@ export function makeDumpFileName(now = new Date()): string {
     return `dump_${stamp}.sql`
 }
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+type TableCursorPlan = {
+    mode: DumpCursorMode
+    columns: string[]
+    aliases: string[]
+}
 
-/**
- * Core engine. Designed to be driven by the Durable Object so each call
- * performs at most one bounded cycle of work (respecting `cycleTimeBudgetMs`),
- * then the DO decides whether to breathe and continue within this request or
- * schedule its alarm for the next cycle.
- */
+type CursorRow = Record<string, unknown>
+
+function dumpChunkKey(dumpId: string, chunkIndex: number): string {
+    return `${dumpId}/${String(chunkIndex).padStart(8, '0')}.sql`
+}
+
+function normalizeCursorValue(value: unknown): DumpCursorValue {
+    if (value === null || value === undefined) {
+        return null
+    }
+    if (
+        typeof value === 'string' ||
+        typeof value === 'number' ||
+        typeof value === 'bigint'
+    ) {
+        return value
+    }
+    return String(value)
+}
+
+function stripCursorColumns(
+    row: CursorRow,
+    aliases: string[]
+): Record<string, unknown> {
+    const result = { ...row }
+    for (const alias of aliases) {
+        delete result[alias]
+    }
+    return result
+}
+
+function rowCursorValues(row: CursorRow, aliases: string[]): DumpCursorValue[] {
+    return aliases.map((alias) => normalizeCursorValue(row[alias]))
+}
+
+function makeCursorAliases(columns: string[]): string[] {
+    const names = new Set(columns.map((column) => column.toLowerCase()))
+    return columns.map((_, index) => {
+        let alias = `${CURSOR_ALIAS_PREFIX}${index}`
+        while (names.has(alias.toLowerCase())) {
+            alias += '_'
+        }
+        return alias
+    })
+}
+
 export class ChunkedDumpEngine {
     constructor(
         private readonly storage: DurableObjectStorage,
@@ -154,22 +192,24 @@ export class ChunkedDumpEngine {
         private readonly options: Required<DumpOptions>
     ) {}
 
-    /** Create or resume a dump. Returns the current state after one cycle. */
-    async startDump(callbackUrl?: string): Promise<DumpState> {
+    async startDump(): Promise<DumpState> {
         const existing = await this.storage.get<DumpState>(DUMP_STATE_KEY)
-        if (existing && !existing.completedAt) {
-            // Resume in-progress dump instead of starting over.
+        if (existing) {
             return this.runCycle()
         }
 
         const tablesResult = await executeOperation(
-            [{ sql: "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'tmp_%';" }],
+            [
+                {
+                    sql: "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'tmp_%';",
+                },
+            ],
             this.dataSource,
             this.config
         )
         const tables = tablesResult
             .map((row: Record<string, unknown>) => String(row.name))
-            .filter((name) => isSafeIdentifier(name))
+            .filter((name) => name.length > 0)
 
         const now = Date.now()
         const state: DumpState = {
@@ -185,7 +225,6 @@ export class ChunkedDumpEngine {
             startedAt: now,
             updatedAt: now,
             totalRows: 0,
-            ...(callbackUrl ? { callbackUrl } : {}),
         }
         await this.storage.put(DUMP_STATE_KEY, state)
         return this.runCycle()
@@ -195,13 +234,10 @@ export class ChunkedDumpEngine {
         return this.storage.get<DumpState>(DUMP_STATE_KEY)
     }
 
-    /**
-     * Run one bounded cycle: serialize schema/data chunks until the time
-     * budget is exhausted, flushing each chunk to R2 (when bound). Returns
-     * the updated state; `completedAt` set when the dump is done.
-     */
     async runCycle(): Promise<DumpState> {
-        const state = (await this.storage.get<DumpState>(DUMP_STATE_KEY)) as DumpState
+        const state = (await this.storage.get<DumpState>(
+            DUMP_STATE_KEY
+        )) as DumpState
         if (!state) {
             throw new Error('No dump in progress')
         }
@@ -227,13 +263,14 @@ export class ChunkedDumpEngine {
             }
             if (this.r2) {
                 await this.r2.put(
-                    `${state.dumpId}/${String(record.chunkIndex).padStart(8, '0')}.sql`,
+                    dumpChunkKey(state.dumpId, record.chunkIndex),
                     record.content
                 )
             }
-            // Persist the chunk in DO storage so a boundless environment can
-            // still reassemble; keep only the tail window to bound memory.
-            await this.storage.put(`${DUMP_CHUNK_KEY}:${record.chunkIndex}`, record)
+            await this.storage.put(
+                `${DUMP_CHUNK_KEY}:${record.chunkIndex}`,
+                record
+            )
             state.chunkIndex += 1
             state.bytesWritten += contentBytes
             content = ''
@@ -241,31 +278,37 @@ export class ChunkedDumpEngine {
             chunkDirty = false
         }
 
-        // Phase 1: schema pass. tableIndex is advanced BEFORE the yield point
-        // so a resumed cycle never re-fetches (and duplicate-emits) a schema.
+        const persist = async () => {
+            state.updatedAt = Date.now()
+            await this.storage.put(DUMP_STATE_KEY, state)
+        }
+
         if (state.phase === 'schema') {
             while (state.tableIndex < state.tables.length) {
                 const table = state.tables[state.tableIndex]
                 state.tableIndex++
-                if (!isSafeIdentifier(table)) continue
                 const schemaResult = await executeOperation(
-                    [{
-                        sql: `SELECT sql FROM sqlite_master WHERE type='table' AND name='${table}';`,
-                    }],
+                    [
+                        {
+                            sql: "SELECT sql FROM sqlite_master WHERE type='table' AND name=?;",
+                            params: [table],
+                        },
+                    ],
                     this.dataSource,
                     this.config
                 )
-                if (schemaResult.length) {
-                    const schema = schemaResult[0].sql
-                    const ddl = `\n-- Table: ${table}\n${schema};\n\n`
+                if (schemaResult.length && schemaResult[0]?.sql) {
+                    const ddl = `\n-- Table: ${sqlCommentLabel(table)}\n${String(schemaResult[0].sql)};\n\n`
                     content += ddl
                     contentBytes += ddl.length
                     chunkDirty = true
                 }
-                if (Date.now() - cycleStart >= this.options.cycleTimeBudgetMs) {
+                if (
+                    contentBytes >= this.options.chunkTargetBytes ||
+                    Date.now() - cycleStart >= this.options.cycleTimeBudgetMs
+                ) {
                     await flushChunk()
-                    state.updatedAt = Date.now()
-                    await this.storage.put(DUMP_STATE_KEY, state)
+                    await persist()
                     return state
                 }
             }
@@ -273,55 +316,92 @@ export class ChunkedDumpEngine {
             state.tableIndex = 0
         }
 
-        // Phase 2: data pass in rowid-batched chunks.
         while (state.tableIndex < state.tables.length) {
             const table = state.tables[state.tableIndex]
-            if (!isSafeIdentifier(table)) {
-                state.tableIndex++
+            if (state.currentTable !== table) {
+                state.currentTable = table
+                state.cursorMode = undefined
+                state.cursorColumns = undefined
+                state.cursorAliases = undefined
+                state.cursorValues = null
                 state.lastFetchedRowId = null
-                continue
             }
 
-            const since = state.lastFetchedRowId ?? 0
-            const rowsResult = (await executeOperation(
-                [{
-                    sql: `SELECT rowid AS __rowid, * FROM "${table}" WHERE rowid > ${since} ORDER BY rowid LIMIT ${this.options.rowsPerBatch};`,
-                }],
+            const plan = await this.resolveTableCursor(table, state)
+            const aliases = state.cursorAliases ?? plan.aliases
+            const cursorColumns = state.cursorColumns ?? plan.columns
+            const cursorValues = state.cursorValues
+            const limit = Math.max(1, Math.floor(this.options.rowsPerBatch))
+            const selectedCursorColumns = cursorColumns
+                .map(
+                    (column, index) =>
+                        `${quoteIdentifier(column)} AS ${quoteIdentifier(aliases[index])}`
+                )
+                .join(', ')
+            const orderColumns = cursorColumns
+                .map((column) => quoteIdentifier(column))
+                .join(', ')
+            const where =
+                cursorValues && cursorValues.length === cursorColumns.length
+                    ? state.cursorMode === 'rowid'
+                        ? ` WHERE ${quoteIdentifier(cursorColumns[0])} > ?`
+                        : ` WHERE (${cursorColumns.map((column) => quoteIdentifier(column)).join(', ')}) > (${cursorValues.map(() => '?').join(', ')})`
+                    : ''
+            const params = cursorValues ? [...cursorValues] : []
+            const rowsResult = ((await executeOperation(
+                [
+                    {
+                        sql: `SELECT ${selectedCursorColumns}, * FROM ${quoteIdentifier(table)}${where} ORDER BY ${orderColumns} LIMIT ${limit};`,
+                        params,
+                    },
+                ],
                 this.dataSource,
                 this.config
-            )) as Record<string, unknown>[]
+            )) ?? []) as CursorRow[]
 
             if (rowsResult.length === 0) {
                 state.tableIndex++
+                state.currentTable = undefined
+                state.cursorMode = undefined
+                state.cursorColumns = undefined
+                state.cursorAliases = undefined
+                state.cursorValues = null
                 state.lastFetchedRowId = null
                 continue
             }
 
-            const withoutRowidCol = rowsResult.map((row) => {
-                const { __rowid, ...rest } = row
-                state.lastFetchedRowId = Number(__rowid ?? state.lastFetchedRowId)
-                return rest
-            })
+            const nextCursor = rowCursorValues(
+                rowsResult[rowsResult.length - 1],
+                aliases
+            )
+            state.cursorValues = nextCursor
+            if (state.cursorMode === 'rowid') {
+                const numeric = Number(nextCursor[0])
+                state.lastFetchedRowId = Number.isFinite(numeric)
+                    ? numeric
+                    : null
+            }
 
-            const { content: batchSql, rowCount } = serializeRows(table, withoutRowidCol)
+            const rows = rowsResult.map((row) =>
+                stripCursorColumns(row, aliases)
+            )
+            const { content: batchSql, rowCount } = serializeRows(table, rows)
             content += batchSql
             contentBytes += batchSql.length
             state.totalRows += rowCount
+            state.chunkRowOffset += rowCount
             chunkDirty = true
 
-            const chunkClosed =
+            if (
                 contentBytes >= this.options.chunkTargetBytes ||
                 Date.now() - cycleStart >= this.options.cycleTimeBudgetMs
-
-            if (chunkClosed) {
+            ) {
                 await flushChunk()
-                state.updatedAt = Date.now()
-                await this.storage.put(DUMP_STATE_KEY, state)
+                await persist()
                 return state
             }
         }
 
-        // Phase 3: completion marker.
         const done = `\n-- Dump complete: ${state.totalRows} rows, ${state.chunkIndex + (chunkDirty ? 1 : 0)} chunks.\n`
         content += done
         contentBytes += done.length
@@ -330,61 +410,56 @@ export class ChunkedDumpEngine {
 
         state.phase = 'complete'
         state.completedAt = Date.now()
-        state.updatedAt = state.completedAt
-        await this.storage.put(DUMP_STATE_KEY, state)
+        await persist()
         return state
     }
 
-    /** True when another cycle should run right now (time still available). */
     shouldContinue(state: DumpState, requestStart: number): boolean {
         if (state.completedAt) return false
         return Date.now() - requestStart < this.options.cycleTimeBudgetMs
     }
 
-    /** Milliseconds to wait before the next cycle (breathing interval). */
     breathingDelayMs(): number {
         return this.options.breathingIntervalMs
     }
 
-    /**
-     * Consolidate all chunk records into a single R2 object via a multipart
-     * upload (`dumps/<dumpId>/<fileName>`), bounded by a time budget so a
-     * multi-GB dump progresses across several DO alarm invocations instead of
-     * one 30s window. Partial progress (uploaded parts + their etags) is
-     * persisted after every part, so an interrupted finalize resumes with
-     * `resumeMultipartUpload` without re-uploading completed parts.
-     *
-     * Returns `{ done: false }` while parts remain; the DO alarm drives the
-     * remaining cycles. Idempotent once `state.finalizedAt` is set.
-     */
     async finalizeDump(
         options: { partSizeBytes?: number; timeBudgetMs?: number } = {}
     ): Promise<{ done: boolean; state: DumpState }> {
-        const state = (await this.storage.get<DumpState>(DUMP_STATE_KEY)) as DumpState
+        const state = (await this.storage.get<DumpState>(
+            DUMP_STATE_KEY
+        )) as DumpState
         if (!state) {
             throw new Error('No dump in progress')
-        }
-        if (state.finalizedAt) {
-            return { done: true, state }
-        }
-        if (!this.r2) {
-            // Without R2 there is nothing to consolidate; the DO-storage
-            // streaming reassembly remains the download path.
-            state.finalizedAt = Date.now()
-            await this.storage.put(DUMP_STATE_KEY, state)
-            return { done: true, state }
         }
         if (!state.completedAt) {
             return { done: false, state }
         }
+        if (state.finalizedAt) {
+            if (this.r2 && !state.temporaryChunksCleanedAt) {
+                const cleaned = await this.cleanupTemporaryChunks(state)
+                return { done: cleaned, state }
+            }
+            return { done: true, state }
+        }
+        if (!this.r2) {
+            state.finalizedAt = Date.now()
+            state.updatedAt = state.finalizedAt
+            await this.storage.put(DUMP_STATE_KEY, state)
+            return { done: true, state }
+        }
 
-        const partSize = options.partSizeBytes ?? this.options.finalizePartSizeBytes
+        const partSize = Math.max(
+            1,
+            Math.floor(
+                options.partSizeBytes ?? this.options.finalizePartSizeBytes
+            )
+        )
         const budget = options.timeBudgetMs ?? this.options.finalizeTimeBudgetMs
-        const key = state.finalObjectKey ?? `dumps/${state.dumpId}/${state.fileName}`
+        const key =
+            state.finalObjectKey ?? `dumps/${state.dumpId}/${state.fileName}`
         const cycleStart = Date.now()
 
-        // Recover the in-flight multipart upload from a previous cycle, or
-        // start a fresh one and persist its uploadId immediately.
         let mpu: R2MultipartUpload
         if (state.finalizeUploadId) {
             mpu = this.r2.resumeMultipartUpload(key, state.finalizeUploadId)
@@ -405,8 +480,6 @@ export class ChunkedDumpEngine {
             await this.storage.put(DUMP_STATE_KEY, state)
         }
 
-        // Stream chunk records into part-sized buffers, skipping the bytes
-        // already uploaded as parts in earlier cycles.
         let skipped = state.finalizeBytes ?? 0
         let partNumber = parts.length + 1
         let buffer: Uint8Array[] = []
@@ -430,11 +503,8 @@ export class ChunkedDumpEngine {
             buffer.push(data)
             bufferLen += data.length
 
-            // Non-final parts must be >= 5 MiB, so flush only at partSize.
             if (bufferLen >= partSize) {
                 if (Date.now() - cycleStart >= budget) {
-                    // Out of budget mid-upload: progress (parts + bytes) is
-                    // already persisted, the next cycle continues cleanly.
                     await persist()
                     return { done: false, state }
                 }
@@ -449,22 +519,19 @@ export class ChunkedDumpEngine {
                 buffer = []
                 bufferLen = 0
             } else if (Date.now() - cycleStart >= budget) {
-                // Budget exhausted while accumulating: the un-uploaded buffer
-                // is rebuilt next cycle from the persisted byte offset.
                 await persist()
                 return { done: false, state }
             }
         }
 
         if (parts.length === 0 && bufferLen === 0) {
-            // Empty dump: nothing to upload, finalize without an object.
             state.finalizedAt = Date.now()
             state.updatedAt = state.finalizedAt
             await this.storage.put(DUMP_STATE_KEY, state)
-            return { done: true, state }
+            const cleaned = await this.cleanupTemporaryChunks(state)
+            return { done: cleaned, state }
         }
 
-        // Tail part (allowed to be smaller than partSize).
         if (bufferLen > 0) {
             const part = await mpu.uploadPart(
                 partNumber,
@@ -476,7 +543,7 @@ export class ChunkedDumpEngine {
 
         const object = await mpu.complete(parts)
         state.finalObjectKey = key
-        state.finalObjectSize = object.size ?? state.finalizeBytes
+        state.finalObjectSize = object?.size ?? state.finalizeBytes
         state.finalizedAt = Date.now()
         state.updatedAt = state.finalizedAt
         state.finalizeUploadId = undefined
@@ -484,28 +551,14 @@ export class ChunkedDumpEngine {
         state.finalizeBytes = undefined
         await this.storage.put(DUMP_STATE_KEY, state)
 
-        // Best-effort cleanup of the per-chunk R2 mirrors; DO storage records
-        // stay as the streaming fallback.
-        for (let i = 0; i < state.chunkIndex; i++) {
-            try {
-                await this.r2.delete(
-                    `${state.dumpId}/${String(i).padStart(8, '0')}.sql`
-                )
-            } catch {
-                // Cleanup is best-effort; leftover mirrors are harmless.
-            }
-        }
-        return { done: true, state }
+        const cleaned = await this.cleanupTemporaryChunks(state)
+        return { done: cleaned, state }
     }
 
-    /**
-     * Presigned download URL for the finalized object. Presigned URL
-     * generation is feature-detected: newer workerd runtimes expose
-     * `R2Bucket.createSignedUrl`, older bindings do not — in that case the
-     * caller falls back to the streaming reassembly endpoint.
-     */
     async getPresignedUrl(expiresInSeconds = 3600): Promise<string | null> {
-        const state = (await this.storage.get<DumpState>(DUMP_STATE_KEY)) as DumpState
+        const state = (await this.storage.get<DumpState>(
+            DUMP_STATE_KEY
+        )) as DumpState
         if (!state?.finalObjectKey || !this.r2) return null
         const creator = (
             this.r2 as R2Bucket & { createSignedUrl?: R2SignedUrlCreator }
@@ -523,14 +576,18 @@ export class ChunkedDumpEngine {
         }
     }
 
-    /** Reassemble the dump from chunk records (or R2 when bound). */
-    async assembleDump(state: DumpState): Promise<ReadableStream<Uint8Array> | null> {
+    async assembleDump(
+        state: DumpState
+    ): Promise<ReadableStream<Uint8Array> | null> {
         if (!state.completedAt) return null
 
-        // Prefer the consolidated multipart object when finalization ran.
         if (state.finalObjectKey && this.r2) {
             const final = await this.r2.get(state.finalObjectKey)
             if (final?.body) return final.body
+        }
+
+        if (state.temporaryChunksCleanedAt) {
+            return null
         }
 
         if (this.r2) {
@@ -555,16 +612,111 @@ export class ChunkedDumpEngine {
         })
     }
 
-    private async concatenateR2(state: DumpState): Promise<ReadableStream<Uint8Array> | null> {
+    private async resolveTableCursor(
+        table: string,
+        state: DumpState
+    ): Promise<TableCursorPlan> {
+        if (state.cursorMode && state.cursorColumns && state.cursorAliases) {
+            return {
+                mode: state.cursorMode,
+                columns: state.cursorColumns,
+                aliases: state.cursorAliases,
+            }
+        }
+
+        const tableInfo = ((await executeOperation(
+            [{ sql: `PRAGMA table_info(${quoteIdentifier(table)});` }],
+            this.dataSource,
+            this.config
+        )) ?? []) as Record<string, unknown>[]
+        const columns = tableInfo.map((row) => String(row.name))
+        const primaryKey = tableInfo
+            .filter((row) => Number(row.pk) > 0)
+            .sort((left, right) => Number(left.pk) - Number(right.pk))
+            .map((row) => String(row.name))
+
+        const rowidAliases = ['rowid', '_rowid_', 'oid'].filter(
+            (alias) => !columns.some((column) => column.toLowerCase() === alias)
+        )
+        for (const alias of rowidAliases) {
+            try {
+                await executeOperation(
+                    [
+                        {
+                            sql: `SELECT ${quoteIdentifier(alias)} AS ${quoteIdentifier(`${CURSOR_ALIAS_PREFIX}probe`)} FROM ${quoteIdentifier(table)} LIMIT 0;`,
+                        },
+                    ],
+                    this.dataSource,
+                    this.config
+                )
+                const plan = {
+                    mode: 'rowid' as const,
+                    columns: [alias],
+                    aliases: makeCursorAliases([alias]),
+                }
+                state.cursorMode = plan.mode
+                state.cursorColumns = plan.columns
+                state.cursorAliases = plan.aliases
+                state.cursorValues = null
+                return plan
+            } catch {}
+        }
+
+        if (primaryKey.length === 0) {
+            throw new Error(
+                `Cannot determine a stable cursor for table ${table}`
+            )
+        }
+        const plan = {
+            mode: 'primary-key' as const,
+            columns: primaryKey,
+            aliases: makeCursorAliases(primaryKey),
+        }
+        state.cursorMode = plan.mode
+        state.cursorColumns = plan.columns
+        state.cursorAliases = plan.aliases
+        state.cursorValues = null
+        return plan
+    }
+
+    private async cleanupTemporaryChunks(state: DumpState): Promise<boolean> {
+        let complete = true
+        for (let i = 0; i < state.chunkIndex; i++) {
+            let r2Deleted = true
+            if (this.r2) {
+                try {
+                    await this.r2.delete(dumpChunkKey(state.dumpId, i))
+                } catch {
+                    r2Deleted = false
+                    complete = false
+                }
+            }
+            if (!r2Deleted) {
+                continue
+            }
+            try {
+                await this.storage.delete(`${DUMP_CHUNK_KEY}:${i}`)
+            } catch {
+                complete = false
+            }
+        }
+        if (complete) {
+            state.temporaryChunksCleanedAt = Date.now()
+        }
+        state.updatedAt = Date.now()
+        await this.storage.put(DUMP_STATE_KEY, state)
+        return complete
+    }
+
+    private async concatenateR2(
+        state: DumpState
+    ): Promise<ReadableStream<Uint8Array> | null> {
         if (!this.r2) return null
-        const head = await this.r2.get(`${state.dumpId}/00000000.sql`)
+        const head = await this.r2.get(dumpChunkKey(state.dumpId, 0))
         if (!head) return null
-        // R2 concatenated reads: stream each part sequentially.
         const parts: ReadableStream<Uint8Array>[] = []
         for (let i = 0; i < state.chunkIndex; i++) {
-            const obj = await this.r2.get(
-                `${state.dumpId}/${String(i).padStart(8, '0')}.sql`
-            )
+            const obj = await this.r2.get(dumpChunkKey(state.dumpId, i))
             if (obj?.body) {
                 parts.push(obj.body)
             }
@@ -573,10 +725,6 @@ export class ChunkedDumpEngine {
     }
 }
 
-/**
- * Feature-detected presigned URL creator exposed by newer R2 runtime
- * bindings (`R2Bucket.createSignedUrl`).
- */
 type R2SignedUrlCreator = (
     key: string,
     expiresInSeconds: number
@@ -592,7 +740,9 @@ function concatUint8(chunks: Uint8Array[], totalLength: number): Uint8Array {
     return out
 }
 
-function concatStreams(streams: ReadableStream<Uint8Array>[]): ReadableStream<Uint8Array> {
+function concatStreams(
+    streams: ReadableStream<Uint8Array>[]
+): ReadableStream<Uint8Array> {
     return new ReadableStream<Uint8Array>({
         async start(controller) {
             for (const stream of streams) {

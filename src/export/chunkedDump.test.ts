@@ -3,6 +3,7 @@ import {
     ChunkedDumpEngine,
     DEFAULT_DUMP_OPTIONS,
     isSafeIdentifier,
+    quoteIdentifier,
     makeDumpFileName,
     serializeRows,
     DUMP_STATE_KEY,
@@ -83,9 +84,7 @@ describe('row serialization', () => {
     })
 
     it('renders NULLs, numbers and booleans unquoted', () => {
-        const { content } = serializeRows('t', [
-            { a: null, b: 1.5, c: true },
-        ])
+        const { content } = serializeRows('t', [{ a: null, b: 1.5, c: true }])
         expect(content).toContain('(NULL, 1.5, true)')
     })
 
@@ -93,6 +92,15 @@ describe('row serialization', () => {
         const { content, rowCount } = serializeRows('t', [])
         expect(content).toBe('')
         expect(rowCount).toBe(0)
+    })
+
+    it('quotes identifiers and serializes null and binary values', () => {
+        const { content } = serializeRows('order "items"', [
+            { 'value "x"': null, payload: new Uint8Array([0, 15, 255]) },
+        ])
+        expect(content).toContain('INSERT INTO "order ""items"""')
+        expect(content).toContain('("value ""x""", "payload")')
+        expect(content).toContain("(NULL, X'000fff')")
     })
 })
 
@@ -107,15 +115,43 @@ describe('ChunkedDumpEngine cycles', () => {
     const setupTables = (tables: string[], schemas: Record<string, string>) => {
         vi.mocked(executeOperation).mockImplementation(async (queries: any) => {
             const sql: string = queries[0].sql
+            const params: unknown[] = queries[0].params ?? []
             if (sql.includes("type='table' AND name NOT LIKE")) {
                 return tables.map((name) => ({ name }))
             }
             if (sql.includes('SELECT sql FROM sqlite_master')) {
-                const match = /name='([^']+)'/.exec(sql)
-                const name = match?.[1] ?? ''
+                const name = String(params[0] ?? '')
                 return schemas[name] ? [{ sql: schemas[name] }] : []
             }
-            // rowid-batched data fetch
+            if (sql.includes('PRAGMA table_info')) {
+                return [{ name: 'id', pk: 1 }]
+            }
+            if (sql.includes('LIMIT 0')) {
+                return []
+            }
+            if (sql.includes('ORDER BY')) {
+                const since = Number(params[0] ?? -1)
+                if (since < 2) {
+                    return since < 0
+                        ? [
+                              {
+                                  __starbase_dump_cursor_0: 0,
+                                  id: 0,
+                              },
+                              {
+                                  __starbase_dump_cursor_0: 1,
+                                  id: 1,
+                              },
+                          ]
+                        : [
+                              {
+                                  __starbase_dump_cursor_0: since + 1,
+                                  id: since + 1,
+                              },
+                          ]
+                }
+                return []
+            }
             return []
         })
     }
@@ -124,20 +160,28 @@ describe('ChunkedDumpEngine cycles', () => {
         setupTables(['users'], { users: 'CREATE TABLE users (id INTEGER)' })
         vi.mocked(executeOperation).mockImplementation(async (queries: any) => {
             const sql: string = queries[0].sql
+            const params: unknown[] = queries[0].params ?? []
             if (sql.includes("name NOT LIKE 'tmp_%'")) {
                 return [{ name: 'users' }]
             }
             if (sql.includes('SELECT sql FROM sqlite_master')) {
                 return [{ sql: 'CREATE TABLE users (id INTEGER)' }]
             }
-            if (sql.includes('WHERE rowid >')) {
-                const since = Number(/rowid > (\d+)/.exec(sql)?.[1] ?? 0)
-                return since === 0
-                    ? [
-                          { __rowid: 1, id: 1 },
-                          { __rowid: 2, id: 2 },
-                      ]
-                    : []
+            if (sql.includes('PRAGMA table_info')) {
+                return [{ name: 'id', pk: 1 }]
+            }
+            if (sql.includes('LIMIT 0')) {
+                return []
+            }
+            if (sql.includes('ORDER BY')) {
+                const since = Number(params[0] ?? -1)
+                if (since < 0) {
+                    return [
+                        { __starbase_dump_cursor_0: -2, id: -2 },
+                        { __starbase_dump_cursor_0: 0, id: 0 },
+                    ]
+                }
+                return since < 1 ? [{ __starbase_dump_cursor_0: 1, id: 1 }] : []
             }
             return []
         })
@@ -147,11 +191,13 @@ describe('ChunkedDumpEngine cycles', () => {
 
         expect(state.completedAt).toBeDefined()
         expect(state.phase).toBe('complete')
-        expect(state.totalRows).toBe(2)
+        expect(state.totalRows).toBe(3)
         expect(state.chunkIndex).toBeGreaterThan(0)
         expect(r2.put).toHaveBeenCalled()
         // Progress persisted in DO storage for resumability.
-        const persisted = (await storage.get(DUMP_STATE_KEY)) as DumpState | undefined
+        const persisted = (await storage.get(DUMP_STATE_KEY)) as
+            | DumpState
+            | undefined
         expect(persisted?.completedAt).toBeDefined()
     })
 
@@ -160,16 +206,24 @@ describe('ChunkedDumpEngine cycles', () => {
         let call = 0
         vi.mocked(executeOperation).mockImplementation(async (queries: any) => {
             const sql: string = queries[0].sql
-            if (sql.includes("name NOT LIKE 'tmp_%'")) return [{ name: 'users' }]
+            const params: unknown[] = queries[0].params ?? []
+            if (sql.includes("name NOT LIKE 'tmp_%'"))
+                return [{ name: 'users' }]
             if (sql.includes('SELECT sql FROM sqlite_master')) {
                 return [{ sql: 'CREATE TABLE users (id INTEGER)' }]
             }
-            if (sql.includes('WHERE rowid >')) {
-                const since = Number(/rowid > (\d+)/.exec(sql)?.[1] ?? 0)
+            if (sql.includes('PRAGMA table_info')) {
+                return [{ name: 'id', pk: 1 }]
+            }
+            if (sql.includes('LIMIT 0')) {
+                return []
+            }
+            if (sql.includes('ORDER BY')) {
+                const since = Number(params[0] ?? -1)
                 call++
-                // Yield after every batch: each cycle emits exactly one row,
-                // and the stream is finite (3 rows total).
-                return since < 3 ? [{ __rowid: since + 1, id: since + 1 }] : []
+                return since < 3
+                    ? [{ __starbase_dump_cursor_0: since + 1, id: since + 1 }]
+                    : []
             }
             return []
         })
@@ -189,26 +243,44 @@ describe('ChunkedDumpEngine cycles', () => {
         expect(state.totalRows).toBeGreaterThan(0)
     })
 
-    it('filters unsafe table names out of the dump plan', async () => {
+    it('quotes valid and unusual table names instead of dropping them', async () => {
+        const dataSqls: string[] = []
         vi.mocked(executeOperation).mockImplementation(async (queries: any) => {
             const sql: string = queries[0].sql
+            const params: unknown[] = queries[0].params ?? []
             if (sql.includes("name NOT LIKE 'tmp_%'")) {
-                return [
-                    { name: 'good_table' },
-                    { name: 'bad"; DROP TABLE users;--' },
-                ]
+                return [{ name: 'good_table' }, { name: 'order items "2026"' }]
             }
             if (sql.includes('SELECT sql FROM sqlite_master')) {
-                return [{ sql: 'CREATE TABLE good_table (id INTEGER)' }]
+                return [
+                    { sql: 'CREATE TABLE "order items ""2026""" (id INTEGER)' },
+                ]
+            }
+            if (sql.includes('PRAGMA table_info')) {
+                return [{ name: 'id', pk: 1 }]
+            }
+            if (sql.includes('LIMIT 0')) return []
+            if (sql.includes('ORDER BY')) {
+                dataSqls.push(sql)
+                return Number(params[0] ?? -1) < 0
+                    ? [{ __starbase_dump_cursor_0: 1, id: 1 }]
+                    : []
             }
             return []
         })
 
         const { engine, storage } = makeEngine()
         const state = await engine.startDump()
-        const persisted = (await storage.get(DUMP_STATE_KEY)) as DumpState | undefined
-        expect(persisted?.tables).toEqual(['good_table'])
-        expect(state.totalRows).toBe(0)
+        const persisted = (await storage.get(DUMP_STATE_KEY)) as
+            | DumpState
+            | undefined
+        expect(persisted?.tables).toEqual(['good_table', 'order items "2026"'])
+        expect(
+            dataSqls.some((sql) =>
+                sql.includes(quoteIdentifier('order items "2026"'))
+            )
+        ).toBe(true)
+        expect(state.totalRows).toBe(2)
     })
 
     it('startDump resumes an in-progress dump instead of restarting', async () => {
@@ -233,7 +305,7 @@ describe('ChunkedDumpEngine cycles', () => {
 
         vi.mocked(executeOperation).mockImplementation(async (queries: any) => {
             const sql: string = queries[0].sql
-            if (sql.includes('WHERE rowid >')) return []
+            if (sql.includes('ORDER BY')) return []
             return []
         })
 
@@ -270,7 +342,7 @@ describe('ChunkedDumpEngine cycles', () => {
         const c1: ChunkRecord = {
             dumpId: 'dump_x',
             chunkIndex: 1,
-            content: "INSERT INTO \"t\" (\"id\") VALUES (1);\n",
+            content: 'INSERT INTO "t" ("id") VALUES (1);\n',
             bytes: 35,
             createdAt: 2,
         }
@@ -288,11 +360,12 @@ describe('ChunkedDumpEngine cycles', () => {
         let captured = ''
         vi.mocked(executeOperation).mockImplementation(async (queries: any) => {
             const sql: string = queries[0].sql
-            if (sql.includes('WHERE rowid >')) {
+            if (sql.includes('ORDER BY')) {
                 captured = sql
                 return []
             }
-            if (sql.includes("name NOT LIKE 'tmp_%'")) return [{ name: 'users' }]
+            if (sql.includes("name NOT LIKE 'tmp_%'"))
+                return [{ name: 'users' }]
             if (sql.includes('SELECT sql FROM sqlite_master')) {
                 return [{ sql: 'CREATE TABLE users (id INTEGER)' }]
             }
@@ -351,7 +424,19 @@ const makeMultipartR2 = () => {
             deletedKeys.push(key)
         },
     }
-    return { r2, uploaded, deleted: () => deletedKeys, completed: () => completed, resumedWith: () => resumedWith, createdFor: () => createdFor, objects, signedUrlResult: () => signedUrlResult, setSigned: (v: { url?: string } | null | undefined) => { signedUrlResult = v } }
+    return {
+        r2,
+        uploaded,
+        deleted: () => deletedKeys,
+        completed: () => completed,
+        resumedWith: () => resumedWith,
+        createdFor: () => createdFor,
+        objects,
+        signedUrlResult: () => signedUrlResult,
+        setSigned: (v: { url?: string } | null | undefined) => {
+            signedUrlResult = v
+        },
+    }
 }
 
 const seedCompletedState = async (
@@ -394,7 +479,12 @@ describe('finalizeDump (R2 multipart upload + presigned URL)', () => {
         const storage = makeStorage()
         const m = makeMultipartR2()
         // 4 chunks of 10 bytes each; partSize 20 → parts of 20, 20, 20(tail).
-        await seedCompletedState(storage, ['AAAAAAAAAA', 'BBBBBBBBBB', 'CCCCCCCCCC', 'DDDDDDDDDD'])
+        await seedCompletedState(storage, [
+            'AAAAAAAAAA',
+            'BBBBBBBBBB',
+            'CCCCCCCCCC',
+            'DDDDDDDDDD',
+        ])
         const engine = new ChunkedDumpEngine(
             storage as unknown as DurableObjectStorage,
             m.r2 as unknown as R2Bucket,
@@ -413,8 +503,37 @@ describe('finalizeDump (R2 multipart upload + presigned URL)', () => {
         expect(state.finalObjectKey).toBe('dumps/dump_fin/dump_fin.sql')
         expect(state.finalObjectSize).toBe(40)
         expect(state.finalizedAt).toBeDefined()
-        // Per-chunk R2 mirrors are cleaned up after a successful complete.
+        expect(state.temporaryChunksCleanedAt).toBeDefined()
         expect(m.deleted().length).toBe(4)
+        expect(await storage.get(`${DUMP_CHUNK_KEY}:0`)).toBeUndefined()
+    })
+
+    it('retries temporary chunk cleanup after a finalized upload', async () => {
+        const storage = makeStorage()
+        const m = makeMultipartR2()
+        await seedCompletedState(storage, ['data'])
+        const originalDelete = m.r2.delete
+        let attempts = 0
+        m.r2.delete = vi.fn(async (key: string) => {
+            attempts++
+            if (attempts === 1) throw new Error('temporary delete failure')
+            return originalDelete(key)
+        })
+        const engine = new ChunkedDumpEngine(
+            storage as unknown as DurableObjectStorage,
+            m.r2 as unknown as R2Bucket,
+            makeDataSource(),
+            makeConfig(),
+            DEFAULT_DUMP_OPTIONS
+        )
+
+        const first = await engine.finalizeDump()
+        expect(first.done).toBe(false)
+        expect(first.state.temporaryChunksCleanedAt).toBeUndefined()
+        expect(await storage.get(`${DUMP_CHUNK_KEY}:0`)).toBeDefined()
+        const second = await engine.finalizeDump()
+        expect(second.done).toBe(true)
+        expect(second.state.temporaryChunksCleanedAt).toBeDefined()
     })
 
     it('resumes an interrupted finalize without re-uploading completed parts', async () => {
@@ -447,7 +566,12 @@ describe('finalizeDump (R2 multipart upload + presigned URL)', () => {
     it('returns done:false when the time budget runs out mid-upload, then finishes on the next cycle', async () => {
         const storage = makeStorage()
         const m = makeMultipartR2()
-        await seedCompletedState(storage, ['AAAAAAAAAA', 'BBBBBBBBBB', 'CCCCCCCCCC', 'DDDDDDDDDD'])
+        await seedCompletedState(storage, [
+            'AAAAAAAAAA',
+            'BBBBBBBBBB',
+            'CCCCCCCCCC',
+            'DDDDDDDDDD',
+        ])
         const engine = new ChunkedDumpEngine(
             storage as unknown as DurableObjectStorage,
             m.r2 as unknown as R2Bucket,
@@ -455,7 +579,10 @@ describe('finalizeDump (R2 multipart upload + presigned URL)', () => {
             makeConfig(),
             { ...DEFAULT_DUMP_OPTIONS }
         )
-        const first = await engine.finalizeDump({ partSizeBytes: 20, timeBudgetMs: -1 })
+        const first = await engine.finalizeDump({
+            partSizeBytes: 20,
+            timeBudgetMs: -1,
+        })
         expect(first.done).toBe(false)
         expect(first.state.finalizeUploadId).toBe('mpu-1')
 
@@ -489,7 +616,8 @@ describe('finalizeDump (R2 multipart upload + presigned URL)', () => {
         })
         m.setSigned({ url: 'https://signed.example/dump?sig=abc' })
         const r2 = Object.assign(m.r2, {
-            createSignedUrl: async () => (m.signedUrlResult() as { url?: string }),
+            createSignedUrl: async () =>
+                m.signedUrlResult() as { url?: string },
         })
         const engine = new ChunkedDumpEngine(
             storage as unknown as DurableObjectStorage,
@@ -522,7 +650,8 @@ describe('finalizeDump (R2 multipart upload + presigned URL)', () => {
         // Unexpected result shape (missing url) must not throw.
         m.setSigned({})
         const r2 = Object.assign(m.r2, {
-            createSignedUrl: async () => (m.signedUrlResult() as { url?: string }),
+            createSignedUrl: async () =>
+                m.signedUrlResult() as { url?: string },
         })
         const engineB = new ChunkedDumpEngine(
             storage as unknown as DurableObjectStorage,
@@ -532,6 +661,25 @@ describe('finalizeDump (R2 multipart upload + presigned URL)', () => {
             { ...DEFAULT_DUMP_OPTIONS }
         )
         await expect(engineB.getPresignedUrl()).resolves.toBeNull()
+    })
+
+    it('does not return an empty fallback after temporary chunks are cleaned', async () => {
+        const storage = makeStorage()
+        const m = makeMultipartR2()
+        const state = await seedCompletedState(storage, ['chunk-content'], {
+            finalObjectKey: 'dumps/dump_fin/dump_fin.sql',
+            finalizedAt: 9,
+            temporaryChunksCleanedAt: 10,
+        })
+        const engine = new ChunkedDumpEngine(
+            storage as unknown as DurableObjectStorage,
+            m.r2 as unknown as R2Bucket,
+            makeDataSource(),
+            makeConfig(),
+            DEFAULT_DUMP_OPTIONS
+        )
+
+        await expect(engine.assembleDump(state)).resolves.toBeNull()
     })
 
     it('assembleDump prefers the consolidated final object', async () => {

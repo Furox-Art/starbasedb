@@ -121,12 +121,14 @@ export class StarbaseDBDurableObject extends DurableObject {
                     {
                         storage: this.storage,
                         env: {
-                            R2_DUMP_BUCKET: (this.env as Env & { R2_DUMP_BUCKET?: R2Bucket })
-                                .R2_DUMP_BUCKET,
+                            R2_DUMP_BUCKET: (
+                                this.env as Env & { R2_DUMP_BUCKET?: R2Bucket }
+                            ).R2_DUMP_BUCKET,
                         },
                         dataSource: this.dumpJobDataSource(),
                         config: { role: 'admin' } as StarbaseDBConfiguration,
-                        setAlarm: (time, options) => this.setAlarm(time, options),
+                        setAlarm: (time, options) =>
+                            this.setAlarm(time, options),
                     },
                     new URLSearchParams()
                 )
@@ -136,13 +138,20 @@ export class StarbaseDBDurableObject extends DurableObject {
             // A finished dump that has not been consolidated yet: merge its
             // chunk records into the single R2 object (multipart, resumable)
             // so presigned download URLs become available.
-            if (dumpState && dumpState.completedAt && !dumpState.finalizedAt) {
+            if (
+                dumpState &&
+                dumpState.completedAt &&
+                (this.env as Env & { R2_DUMP_BUCKET?: R2Bucket })
+                    .R2_DUMP_BUCKET &&
+                (!dumpState.finalizedAt || !dumpState.temporaryChunksCleanedAt)
+            ) {
                 const { runDumpFinalize } = await import('./export/dump')
                 await runDumpFinalize({
                     storage: this.storage,
                     env: {
-                        R2_DUMP_BUCKET: (this.env as Env & { R2_DUMP_BUCKET?: R2Bucket })
-                            .R2_DUMP_BUCKET,
+                        R2_DUMP_BUCKET: (
+                            this.env as Env & { R2_DUMP_BUCKET?: R2Bucket }
+                        ).R2_DUMP_BUCKET,
                     },
                     dataSource: this.dumpJobDataSource(),
                     config: { role: 'admin' } as StarbaseDBConfiguration,
@@ -357,8 +366,9 @@ export class StarbaseDBDurableObject extends DurableObject {
                 env: {
                     // Optional binding; deployers add it to wrangler.toml when
                     // they want R2-backed dumps. Absent = storage-only mode.
-                    R2_DUMP_BUCKET: (this.env as Env & { R2_DUMP_BUCKET?: R2Bucket })
-                        .R2_DUMP_BUCKET,
+                    R2_DUMP_BUCKET: (
+                        this.env as Env & { R2_DUMP_BUCKET?: R2Bucket }
+                    ).R2_DUMP_BUCKET,
                 },
                 dataSource: this.dumpJobDataSource(),
                 config,
@@ -376,8 +386,9 @@ export class StarbaseDBDurableObject extends DurableObject {
         return dumpJobStatus({
             storage: this.storage,
             env: {
-                R2_DUMP_BUCKET: (this.env as Env & { R2_DUMP_BUCKET?: R2Bucket })
-                    .R2_DUMP_BUCKET,
+                R2_DUMP_BUCKET: (
+                    this.env as Env & { R2_DUMP_BUCKET?: R2Bucket }
+                ).R2_DUMP_BUCKET,
             },
             dataSource: this.dumpJobDataSource(),
             config,
