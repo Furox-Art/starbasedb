@@ -4,13 +4,14 @@ import { executeOperation } from './index'
 
 export const DUMP_STATE_KEY = 'tmp_dump_state'
 export const DUMP_CHUNK_KEY = 'tmp_dump_chunk'
+export const MIN_R2_PART_SIZE_BYTES = 5 * 1024 * 1024
 
 export const DEFAULT_DUMP_OPTIONS = {
     cycleTimeBudgetMs: 5_000,
     breathingIntervalMs: 5_000,
     rowsPerBatch: 500,
     chunkTargetBytes: 512 * 1024,
-    finalizePartSizeBytes: 5 * 1024 * 1024,
+    finalizePartSizeBytes: MIN_R2_PART_SIZE_BYTES,
     finalizeTimeBudgetMs: 20_000,
 } as const
 
@@ -47,6 +48,7 @@ export interface DumpState {
     finalizeUploadId?: string
     finalizeParts?: R2UploadedPart[]
     finalizeBytes?: number
+    finalizePartSizeBytes?: number
     currentTable?: string
     cursorMode?: DumpCursorMode
     cursorColumns?: string[]
@@ -183,14 +185,31 @@ function makeCursorAliases(columns: string[]): string[] {
     })
 }
 
+export function normalizePartSizeBytes(value: unknown): number {
+    const numeric = typeof value === 'number' ? value : Number(value)
+    if (!Number.isFinite(numeric)) {
+        return MIN_R2_PART_SIZE_BYTES
+    }
+    return Math.max(MIN_R2_PART_SIZE_BYTES, Math.floor(numeric))
+}
+
 export class ChunkedDumpEngine {
     constructor(
         private readonly storage: DurableObjectStorage,
         private readonly r2: R2Bucket | undefined,
         private readonly dataSource: DataSource,
         private readonly config: StarbaseDBConfiguration,
-        private readonly options: Required<DumpOptions>
-    ) {}
+        options: Required<DumpOptions>
+    ) {
+        this.options = {
+            ...options,
+            finalizePartSizeBytes: normalizePartSizeBytes(
+                options.finalizePartSizeBytes
+            ),
+        }
+    }
+
+    private readonly options: Required<DumpOptions>
 
     async startDump(): Promise<DumpState> {
         const existing = await this.storage.get<DumpState>(DUMP_STATE_KEY)
@@ -225,6 +244,7 @@ export class ChunkedDumpEngine {
             startedAt: now,
             updatedAt: now,
             totalRows: 0,
+            finalizePartSizeBytes: this.options.finalizePartSizeBytes,
         }
         await this.storage.put(DUMP_STATE_KEY, state)
         return this.runCycle()
@@ -445,10 +465,32 @@ export class ChunkedDumpEngine {
         if (!state) {
             throw new Error('No dump in progress')
         }
+
+        const persistedPartSize = state.finalizePartSizeBytes
+        const requestedPartSize =
+            persistedPartSize ??
+            options.partSizeBytes ??
+            this.options.finalizePartSizeBytes
+        const partSize = normalizePartSizeBytes(requestedPartSize)
+        const partSizeChanged = state.finalizePartSizeBytes !== partSize
+        const resetMultipart =
+            Boolean(state.finalizeUploadId) &&
+            (persistedPartSize === undefined || persistedPartSize !== partSize)
+        if (partSizeChanged) {
+            state.finalizePartSizeBytes = partSize
+        }
+        const persistPartSize = async () => {
+            if (!partSizeChanged) return
+            state.updatedAt = Date.now()
+            await this.storage.put(DUMP_STATE_KEY, state)
+        }
+
         if (!state.completedAt) {
+            await persistPartSize()
             return { done: false, state }
         }
         if (state.finalizedAt) {
+            await persistPartSize()
             if (this.r2 && !state.temporaryChunksCleanedAt) {
                 const cleaned = await this.cleanupTemporaryChunks(state)
                 return { done: cleaned, state }
@@ -456,23 +498,45 @@ export class ChunkedDumpEngine {
             return { done: true, state }
         }
         if (!this.r2) {
+            await persistPartSize()
             state.finalizedAt = Date.now()
             state.updatedAt = state.finalizedAt
             await this.storage.put(DUMP_STATE_KEY, state)
             return { done: true, state }
         }
 
-        const partSize = Math.max(
-            1,
-            Math.floor(
-                options.partSizeBytes ?? this.options.finalizePartSizeBytes
-            )
-        )
         const budget = options.timeBudgetMs ?? this.options.finalizeTimeBudgetMs
         const key =
             state.finalObjectKey ?? `dumps/${state.dumpId}/${state.fileName}`
-        const cycleStart = Date.now()
+        let multipartReset = false
+        if (resetMultipart && state.finalizeUploadId) {
+            const upload = this.r2.resumeMultipartUpload(
+                key,
+                state.finalizeUploadId
+            )
+            try {
+                await upload.abort()
+            } catch {
+                return { done: false, state }
+            }
+            state.finalizeUploadId = undefined
+            state.finalizeParts = undefined
+            state.finalizeBytes = undefined
+            multipartReset = true
+        }
+        if (partSizeChanged || multipartReset) {
+            state.updatedAt = Date.now()
+            await this.storage.put(DUMP_STATE_KEY, state)
+        }
+        const hasContent = await this.hasChunkContent(state)
+        if (!hasContent) {
+            if (state.bytesWritten > 0) {
+                throw new Error('Dump chunk data is missing')
+            }
+            return this.finalizeEmptyDump(state, key)
+        }
 
+        const cycleStart = Date.now()
         let mpu: R2MultipartUpload
         if (state.finalizeUploadId) {
             mpu = this.r2.resumeMultipartUpload(key, state.finalizeUploadId)
@@ -493,10 +557,10 @@ export class ChunkedDumpEngine {
             await this.storage.put(DUMP_STATE_KEY, state)
         }
 
-        let skipped = state.finalizeBytes ?? 0
+        let skipped = Math.max(0, state.finalizeBytes ?? 0)
         let partNumber = parts.length + 1
-        let buffer: Uint8Array[] = []
-        let bufferLen = 0
+        const buffer = new Uint8Array(partSize)
+        let bufferLength = 0
 
         for (let i = 0; i < state.chunkIndex; i++) {
             const record = await this.storage.get<ChunkRecord>(
@@ -504,54 +568,63 @@ export class ChunkedDumpEngine {
             )
             if (!record?.content) continue
             const encoded = encoder.encode(record.content)
-            let data = encoded
+            let offset = 0
+            if (skipped >= encoded.length) {
+                skipped -= encoded.length
+                continue
+            }
             if (skipped > 0) {
-                if (skipped >= encoded.length) {
-                    skipped -= encoded.length
-                    continue
-                }
-                data = encoded.subarray(skipped)
+                offset = skipped
                 skipped = 0
             }
-            buffer.push(data)
-            bufferLen += data.length
 
-            if (bufferLen >= partSize) {
-                if (Date.now() - cycleStart >= budget) {
-                    await persist()
-                    return { done: false, state }
-                }
-                const part = await mpu.uploadPart(
-                    partNumber,
-                    concatUint8(buffer, bufferLen)
+            while (offset < encoded.length) {
+                const length = Math.min(
+                    partSize - bufferLength,
+                    encoded.length - offset
                 )
-                parts.push({ partNumber, etag: part.etag })
-                state.finalizeBytes = (state.finalizeBytes ?? 0) + bufferLen
-                await persist()
-                partNumber++
-                buffer = []
-                bufferLen = 0
-            } else if (Date.now() - cycleStart >= budget) {
+                buffer.set(
+                    encoded.subarray(offset, offset + length),
+                    bufferLength
+                )
+                bufferLength += length
+                offset += length
+
+                if (bufferLength === partSize) {
+                    if (Date.now() - cycleStart >= budget) {
+                        await persist()
+                        return { done: false, state }
+                    }
+                    const part = await mpu.uploadPart(
+                        partNumber,
+                        buffer.slice(0, partSize)
+                    )
+                    parts.push({ partNumber, etag: part.etag })
+                    state.finalizeBytes = (state.finalizeBytes ?? 0) + partSize
+                    bufferLength = 0
+                    await persist()
+                    partNumber++
+                }
+            }
+        }
+
+        if (bufferLength > 0) {
+            if (Date.now() - cycleStart >= budget) {
                 await persist()
                 return { done: false, state }
             }
-        }
-
-        if (parts.length === 0 && bufferLen === 0) {
-            state.finalizedAt = Date.now()
-            state.updatedAt = state.finalizedAt
-            await this.storage.put(DUMP_STATE_KEY, state)
-            const cleaned = await this.cleanupTemporaryChunks(state)
-            return { done: cleaned, state }
-        }
-
-        if (bufferLen > 0) {
             const part = await mpu.uploadPart(
                 partNumber,
-                concatUint8(buffer, bufferLen)
+                buffer.slice(0, bufferLength)
             )
             parts.push({ partNumber, etag: part.etag })
-            state.finalizeBytes = (state.finalizeBytes ?? 0) + bufferLen
+            state.finalizeBytes = (state.finalizeBytes ?? 0) + bufferLength
+            bufferLength = 0
+            await persist()
+        }
+
+        if (parts.length === 0) {
+            return { done: false, state }
         }
 
         const object = await mpu.complete(parts)
@@ -692,6 +765,55 @@ export class ChunkedDumpEngine {
         return plan
     }
 
+    private async hasChunkContent(state: DumpState): Promise<boolean> {
+        for (let i = 0; i < state.chunkIndex; i++) {
+            const record = await this.storage.get<ChunkRecord>(
+                `${DUMP_CHUNK_KEY}:${i}`
+            )
+            if (record?.content) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private async finalizeEmptyDump(
+        state: DumpState,
+        key: string
+    ): Promise<{ done: boolean; state: DumpState }> {
+        const r2 = this.r2
+        if (!r2) {
+            throw new Error(
+                'R2 binding is required for empty dump finalization'
+            )
+        }
+        if (state.finalizeUploadId) {
+            const upload = r2.resumeMultipartUpload(key, state.finalizeUploadId)
+            try {
+                await upload.abort()
+            } catch {
+                return { done: false, state }
+            }
+            state.finalizeUploadId = undefined
+            state.finalizeParts = undefined
+            state.finalizeBytes = undefined
+            state.updatedAt = Date.now()
+            await this.storage.put(DUMP_STATE_KEY, state)
+        }
+
+        await r2.put(key, new Uint8Array(0))
+        state.finalObjectKey = key
+        state.finalObjectSize = 0
+        state.finalizedAt = Date.now()
+        state.updatedAt = state.finalizedAt
+        state.finalizeUploadId = undefined
+        state.finalizeParts = undefined
+        state.finalizeBytes = undefined
+        await this.storage.put(DUMP_STATE_KEY, state)
+        const cleaned = await this.cleanupTemporaryChunks(state)
+        return { done: cleaned, state }
+    }
+
     private async cleanupTemporaryChunks(state: DumpState): Promise<boolean> {
         let complete = true
         for (let i = 0; i < state.chunkIndex; i++) {
@@ -742,16 +864,6 @@ type R2SignedUrlCreator = (
     key: string,
     expiresInSeconds: number
 ) => Promise<{ url?: string } | null>
-
-function concatUint8(chunks: Uint8Array[], totalLength: number): Uint8Array {
-    const out = new Uint8Array(totalLength)
-    let offset = 0
-    for (const chunk of chunks) {
-        out.set(chunk, offset)
-        offset += chunk.length
-    }
-    return out
-}
 
 function concatStreams(
     streams: ReadableStream<Uint8Array>[]

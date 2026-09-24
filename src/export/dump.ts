@@ -5,6 +5,7 @@ import { createResponse } from '../utils'
 import {
     ChunkedDumpEngine,
     DEFAULT_DUMP_OPTIONS,
+    normalizePartSizeBytes,
     quoteIdentifier,
     sqlCommentLabel,
     isSafeIdentifier,
@@ -42,7 +43,12 @@ export function parseDumpOptions(searchParams: URLSearchParams): DumpOptions {
     readNumber('breathMs', 'breathingIntervalMs')
     readNumber('rows', 'rowsPerBatch')
     readNumber('chunkBytes', 'chunkTargetBytes')
-    readNumber('partBytes', 'finalizePartSizeBytes')
+    const rawPartBytes = searchParams.get('partBytes')
+    if (rawPartBytes !== null) {
+        options.finalizePartSizeBytes = normalizePartSizeBytes(
+            Number(rawPartBytes)
+        )
+    }
     readNumber('finalizeMs', 'finalizeTimeBudgetMs')
     return options
 }

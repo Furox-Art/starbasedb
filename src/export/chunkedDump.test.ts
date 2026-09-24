@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import {
     ChunkedDumpEngine,
     DEFAULT_DUMP_OPTIONS,
+    MIN_R2_PART_SIZE_BYTES,
+    normalizePartSizeBytes,
     isSafeIdentifier,
     quoteIdentifier,
     makeDumpFileName,
@@ -13,6 +15,7 @@ import {
     type DumpState,
 } from './chunkedDump'
 import { executeOperation } from './index'
+import { parseDumpOptions } from './dump'
 import type { DataSource } from '../types'
 import type { StarbaseDBConfiguration } from '../handler'
 
@@ -392,11 +395,14 @@ type UploadedPart = { partNumber: number; etag: string }
 
 const makeMultipartR2 = () => {
     const uploaded: { partNumber: number; size: number }[] = []
+    const uploadedContents: { partNumber: number; content: string }[] = []
     let completed: UploadedPart[] | null = null
     let resumedWith: string | null = null
     let createdFor: string | null = null
+    let aborted = 0
     let signedUrlResult: { url?: string } | null | undefined = undefined
     const deletedKeys: string[] = []
+    const puts: { key: string; size: number; content: string }[] = []
     const objects = new Map<string, { body: ReadableStream<Uint8Array> }>()
 
     const mpu = {
@@ -404,9 +410,15 @@ const makeMultipartR2 = () => {
         uploadId: 'mpu-1',
         uploadPart: async (partNumber: number, value: Uint8Array) => {
             uploaded.push({ partNumber, size: value.length })
+            uploadedContents.push({
+                partNumber,
+                content: new TextDecoder().decode(value),
+            })
             return { partNumber, etag: `etag-${partNumber}` }
         },
-        abort: async () => undefined,
+        abort: async () => {
+            aborted++
+        },
         complete: async (parts: UploadedPart[]) => {
             completed = parts
             const total = uploaded.reduce((sum, p) => sum + p.size, 0)
@@ -425,7 +437,23 @@ const makeMultipartR2 = () => {
             mpu.key = key
             return mpu
         },
-        put: async () => undefined,
+        put: async (key: string, value: string | Uint8Array) => {
+            const bytes =
+                typeof value === 'string'
+                    ? new TextEncoder().encode(value)
+                    : value
+            const content = new TextDecoder().decode(bytes)
+            puts.push({ key, size: bytes.length, content })
+            objects.set(key, {
+                body: new ReadableStream<Uint8Array>({
+                    start(controller) {
+                        if (bytes.length > 0) controller.enqueue(bytes)
+                        controller.close()
+                    },
+                }),
+            })
+            return { key, size: bytes.length }
+        },
         get: async (key: string) => objects.get(key) ?? null,
         delete: async (key: string) => {
             deletedKeys.push(key)
@@ -434,6 +462,9 @@ const makeMultipartR2 = () => {
     return {
         r2,
         uploaded,
+        uploadedContents: () => uploadedContents,
+        puts: () => puts,
+        aborted: () => aborted,
         deleted: () => deletedKeys,
         completed: () => completed,
         resumedWith: () => resumedWith,
@@ -465,6 +496,7 @@ const seedCompletedState = async (
         updatedAt: 2,
         completedAt: 3,
         totalRows: 0,
+        finalizePartSizeBytes: MIN_R2_PART_SIZE_BYTES,
         ...extra,
     }
     for (let i = 0; i < chunks.length; i++) {
@@ -482,36 +514,42 @@ const seedCompletedState = async (
 }
 
 describe('finalizeDump (R2 multipart upload + presigned URL)', () => {
-    it('uploads part-sized parts, completes the object and cleans chunk mirrors', async () => {
+    it('aggregates uneven chunks into fixed-size parts with a small tail', async () => {
         const storage = makeStorage()
         const m = makeMultipartR2()
-        // 4 chunks of 10 bytes each; partSize 20 → parts of 20, 20, 20(tail).
-        await seedCompletedState(storage, [
-            'AAAAAAAAAA',
-            'BBBBBBBBBB',
-            'CCCCCCCCCC',
-            'DDDDDDDDDD',
-        ])
+        const partSize = MIN_R2_PART_SIZE_BYTES
+        const chunks = ['A'.repeat(partSize + 1), 'B'.repeat(partSize - 1), 'C']
+        await seedCompletedState(storage, chunks)
         const engine = new ChunkedDumpEngine(
             storage as unknown as DurableObjectStorage,
             m.r2 as unknown as R2Bucket,
             makeDataSource(),
             makeConfig(),
-            { ...DEFAULT_DUMP_OPTIONS }
+            DEFAULT_DUMP_OPTIONS
         )
-        const { done, state } = await engine.finalizeDump({ partSizeBytes: 20 })
+        const { done, state } = await engine.finalizeDump({ partSizeBytes: 1 })
 
         expect(done).toBe(true)
         expect(m.createdFor()).toBe('dumps/dump_fin/dump_fin.sql')
-        // 40 bytes at partSize 20 → exactly two full parts, no tail.
-        expect(m.uploaded.map((p) => p.size)).toEqual([20, 20])
-        expect(m.uploaded.map((p) => p.partNumber)).toEqual([1, 2])
-        expect(m.completed()?.length).toBe(2)
+        expect(m.uploaded.map((p) => p.size)).toEqual([partSize, partSize, 1])
+        expect(m.uploaded.map((p) => p.partNumber)).toEqual([1, 2, 3])
+        expect(
+            m
+                .uploadedContents()
+                .map((p) => p.content)
+                .join('')
+        ).toBe(chunks.join(''))
+        expect(m.completed()).toEqual([
+            { partNumber: 1, etag: 'etag-1' },
+            { partNumber: 2, etag: 'etag-2' },
+            { partNumber: 3, etag: 'etag-3' },
+        ])
         expect(state.finalObjectKey).toBe('dumps/dump_fin/dump_fin.sql')
-        expect(state.finalObjectSize).toBe(40)
+        expect(state.finalObjectSize).toBe(partSize * 2 + 1)
+        expect(state.finalizePartSizeBytes).toBe(MIN_R2_PART_SIZE_BYTES)
         expect(state.finalizedAt).toBeDefined()
         expect(state.temporaryChunksCleanedAt).toBeDefined()
-        expect(m.deleted().length).toBe(4)
+        expect(m.deleted().length).toBe(3)
         expect(await storage.get(`${DUMP_CHUNK_KEY}:0`)).toBeUndefined()
     })
 
@@ -543,58 +581,166 @@ describe('finalizeDump (R2 multipart upload + presigned URL)', () => {
         expect(second.state.temporaryChunksCleanedAt).toBeDefined()
     })
 
-    it('resumes an interrupted finalize without re-uploading completed parts', async () => {
+    it('resumes after multiple compliant parts without re-uploading bytes', async () => {
         const storage = makeStorage()
         const m = makeMultipartR2()
-        const chunks = ['AAAAAAAAAA', 'BBBBBBBBBB', 'CCCCCCCCCC', 'DDDDDDDDDD']
-        // First part (chunk 0 + chunk 1 = 20 bytes) already uploaded.
+        const partSize = MIN_R2_PART_SIZE_BYTES
+        const chunks = [
+            'A'.repeat(partSize + 1),
+            'B'.repeat(partSize - 1),
+            'C'.repeat(partSize + 1),
+            'D'.repeat(partSize),
+        ]
         await seedCompletedState(storage, chunks, {
             finalObjectKey: 'dumps/dump_fin/dump_fin.sql',
             finalizeUploadId: 'mpu-9',
-            finalizeParts: [{ partNumber: 1, etag: 'etag-1' }],
-            finalizeBytes: 20,
+            finalizeParts: [
+                { partNumber: 1, etag: 'etag-1' },
+                { partNumber: 2, etag: 'etag-2' },
+            ],
+            finalizeBytes: partSize * 2,
+            finalizePartSizeBytes: partSize,
         })
         const engine = new ChunkedDumpEngine(
             storage as unknown as DurableObjectStorage,
             m.r2 as unknown as R2Bucket,
             makeDataSource(),
             makeConfig(),
-            { ...DEFAULT_DUMP_OPTIONS }
+            DEFAULT_DUMP_OPTIONS
         )
-        const { done } = await engine.finalizeDump({ partSizeBytes: 20 })
+        const { done } = await engine.finalizeDump({ partSizeBytes: 1 })
 
         expect(done).toBe(true)
         expect(m.resumedWith()).toBe('mpu-9')
-        // Only the remaining 20 bytes upload, as part 2 — no re-upload.
-        expect(m.uploaded).toEqual([{ partNumber: 2, size: 20 }])
-        expect(m.completed()?.length).toBe(2)
+        expect(m.uploaded).toEqual([
+            { partNumber: 3, size: partSize },
+            { partNumber: 4, size: partSize },
+            { partNumber: 5, size: 1 },
+        ])
+        expect(m.completed()).toEqual([
+            { partNumber: 1, etag: 'etag-1' },
+            { partNumber: 2, etag: 'etag-2' },
+            { partNumber: 3, etag: 'etag-3' },
+            { partNumber: 4, etag: 'etag-4' },
+            { partNumber: 5, etag: 'etag-5' },
+        ])
     })
 
-    it('returns done:false when the time budget runs out mid-upload, then finishes on the next cycle', async () => {
+    it('normalizes under-minimum API and persisted part sizes', async () => {
+        expect(normalizePartSizeBytes(1)).toBe(MIN_R2_PART_SIZE_BYTES)
+        expect(
+            parseDumpOptions(new URLSearchParams('partBytes=1'))
+                .finalizePartSizeBytes
+        ).toBe(MIN_R2_PART_SIZE_BYTES)
+        expect(
+            parseDumpOptions(new URLSearchParams('partBytes=0'))
+                .finalizePartSizeBytes
+        ).toBe(MIN_R2_PART_SIZE_BYTES)
+        expect(
+            parseDumpOptions(new URLSearchParams('partBytes=invalid'))
+                .finalizePartSizeBytes
+        ).toBe(MIN_R2_PART_SIZE_BYTES)
+
         const storage = makeStorage()
         const m = makeMultipartR2()
-        await seedCompletedState(storage, [
-            'AAAAAAAAAA',
-            'BBBBBBBBBB',
-            'CCCCCCCCCC',
-            'DDDDDDDDDD',
-        ])
+        await seedCompletedState(storage, ['x'], {
+            finalizePartSizeBytes: 1,
+        })
         const engine = new ChunkedDumpEngine(
             storage as unknown as DurableObjectStorage,
             m.r2 as unknown as R2Bucket,
             makeDataSource(),
             makeConfig(),
-            { ...DEFAULT_DUMP_OPTIONS }
+            DEFAULT_DUMP_OPTIONS
         )
-        const first = await engine.finalizeDump({
-            partSizeBytes: 20,
-            timeBudgetMs: -1,
+        const result = await engine.finalizeDump({ partSizeBytes: 1 })
+
+        expect(result.done).toBe(true)
+        expect(result.state.finalizePartSizeBytes).toBe(MIN_R2_PART_SIZE_BYTES)
+        expect(m.uploaded).toEqual([{ partNumber: 1, size: 1 }])
+    })
+
+    it('aborts an invalid persisted multipart before restarting it', async () => {
+        const storage = makeStorage()
+        const m = makeMultipartR2()
+        await seedCompletedState(storage, ['x'], {
+            finalizeUploadId: 'old-upload',
+            finalizeParts: [{ partNumber: 1, etag: 'old-etag' }],
+            finalizeBytes: 1,
+            finalizePartSizeBytes: 1,
         })
+        const engine = new ChunkedDumpEngine(
+            storage as unknown as DurableObjectStorage,
+            m.r2 as unknown as R2Bucket,
+            makeDataSource(),
+            makeConfig(),
+            DEFAULT_DUMP_OPTIONS
+        )
+        const result = await engine.finalizeDump({ partSizeBytes: 1 })
+
+        expect(result.done).toBe(true)
+        expect(m.aborted()).toBe(1)
+        expect(m.uploaded).toEqual([{ partNumber: 1, size: 1 }])
+        expect(m.completed()?.length).toBe(1)
+        expect(result.state.finalizePartSizeBytes).toBe(MIN_R2_PART_SIZE_BYTES)
+    })
+
+    it('writes an empty downloadable object without creating a multipart upload', async () => {
+        const storage = makeStorage()
+        const m = makeMultipartR2()
+        await seedCompletedState(storage, [])
+        const engine = new ChunkedDumpEngine(
+            storage as unknown as DurableObjectStorage,
+            m.r2 as unknown as R2Bucket,
+            makeDataSource(),
+            makeConfig(),
+            DEFAULT_DUMP_OPTIONS
+        )
+        const result = await engine.finalizeDump({ partSizeBytes: 1 })
+
+        expect(result.done).toBe(true)
+        expect(m.createdFor()).toBeNull()
+        expect(m.uploaded).toEqual([])
+        expect(m.completed()).toBeNull()
+        expect(m.aborted()).toBe(0)
+        expect(m.puts()).toEqual([
+            {
+                key: 'dumps/dump_fin/dump_fin.sql',
+                size: 0,
+                content: '',
+            },
+        ])
+        expect(result.state.finalObjectKey).toBe('dumps/dump_fin/dump_fin.sql')
+        expect(result.state.finalObjectSize).toBe(0)
+        expect(result.state.finalizeUploadId).toBeUndefined()
+        expect(result.state.finalizeParts).toBeUndefined()
+        expect(result.state.finalizedAt).toBeDefined()
+
+        const stream = await engine.assembleDump(result.state)
+        expect(stream).not.toBeNull()
+        expect(await new Response(stream as ReadableStream).text()).toBe('')
+    })
+
+    it('returns done:false when the time budget runs out, then finishes compliant parts', async () => {
+        const storage = makeStorage()
+        const m = makeMultipartR2()
+        const partSize = MIN_R2_PART_SIZE_BYTES
+        const chunks = ['A'.repeat(partSize + 1), 'B'.repeat(partSize - 1), 'C']
+        await seedCompletedState(storage, chunks)
+        const engine = new ChunkedDumpEngine(
+            storage as unknown as DurableObjectStorage,
+            m.r2 as unknown as R2Bucket,
+            makeDataSource(),
+            makeConfig(),
+            DEFAULT_DUMP_OPTIONS
+        )
+        const first = await engine.finalizeDump({ timeBudgetMs: -1 })
         expect(first.done).toBe(false)
         expect(first.state.finalizeUploadId).toBe('mpu-1')
 
-        const second = await engine.finalizeDump({ partSizeBytes: 20 })
+        const second = await engine.finalizeDump()
         expect(second.done).toBe(true)
+        expect(m.uploaded.map((p) => p.size)).toEqual([partSize, partSize, 1])
         expect(second.state.finalizedAt).toBeDefined()
     })
 

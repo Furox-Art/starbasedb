@@ -1,7 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { runDumpJob, dumpJobStatus, type DumpEngineHost } from './dump'
 import { executeOperation } from './index'
-import { DUMP_STATE_KEY, type DumpState } from './chunkedDump'
+import {
+    DUMP_STATE_KEY,
+    MIN_R2_PART_SIZE_BYTES,
+    type DumpState,
+} from './chunkedDump'
 import type { DataSource } from '../types'
 import type { StarbaseDBConfiguration } from '../handler'
 
@@ -113,6 +117,19 @@ describe('dump job lifecycle', () => {
         expect(fetchSpy).not.toHaveBeenCalled()
         expect('callbackUrl' in firstState).toBe(false)
         fetchSpy.mockRestore()
+    })
+
+    it('normalizes the part size in persisted job state', async () => {
+        setupCompleteQueries()
+        const { host } = makeHost()
+        const response = await runDumpJob(
+            host,
+            new URLSearchParams({ partBytes: '1' })
+        )
+        await response.arrayBuffer()
+        const state = (await host.storage.get(DUMP_STATE_KEY)) as DumpState
+
+        expect(state.finalizePartSizeBytes).toBe(MIN_R2_PART_SIZE_BYTES)
     })
 
     it('returns a resumable response and schedules the next cycle when work remains', async () => {
